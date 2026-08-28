@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: droneris-edit-render
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://edit.droneris.tech
+      - key: DRONERIS_MAX_PARALLEL_RENDERS
+        value: "1"
+      - key: DRONERIS_JOB_TTL_SECONDS
+        value: "21600"

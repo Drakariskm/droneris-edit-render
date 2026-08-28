@@ -1,0 +1,15 @@
+# 1) Upload + First Cut
+curl -X POST "https://YOUR-SERVICE.onrender.com/api/jobs" \
+  -F "video=@sample.mp4" \
+  -F "source_type=REAL_FLIGHT" \
+  -F "mission_id=MIS-TEST"
+
+# 2) Render
+curl -X POST "https://YOUR-SERVICE.onrender.com/api/jobs/JOB_ID/render" \
+  -F 'plan={"scenes":[{"start":0,"end":8,"enabled":true,"speed":1,"corrections":[]}]}'
+
+# 3) Status
+curl "https://YOUR-SERVICE.onrender.com/api/jobs/JOB_ID"
+
+# 4) Download
+curl -L "https://YOUR-SERVICE.onrender.com/api/jobs/JOB_ID/download" -o DRONERIS_FINAL.mp4
