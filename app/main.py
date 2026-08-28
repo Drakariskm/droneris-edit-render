@@ -16,11 +16,19 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.0.0"
+APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.1.0_FREE_SAFE"
 ROOT = Path(os.environ.get("DRONERIS_JOB_ROOT", "/tmp/droneris_render_jobs"))
 ROOT.mkdir(parents=True, exist_ok=True)
 TTL_SECONDS = int(os.environ.get("DRONERIS_JOB_TTL_SECONDS", "21600"))  # 6 h
 MAX_UPLOAD_BYTES = int(os.environ.get("DRONERIS_MAX_UPLOAD_BYTES", str(2 * 1024**3)))  # 2 GiB app guard
+
+# Render Free safety profile: keep FFmpeg memory/CPU bounded.
+RENDER_WIDTH = int(os.environ.get("DRONERIS_RENDER_WIDTH", "1280"))
+RENDER_HEIGHT = int(os.environ.get("DRONERIS_RENDER_HEIGHT", "720"))
+RENDER_FPS = int(os.environ.get("DRONERIS_RENDER_FPS", "30"))
+FFMPEG_THREADS = max(1, int(os.environ.get("DRONERIS_FFMPEG_THREADS", "1")))
+FFMPEG_PRESET = os.environ.get("DRONERIS_FFMPEG_PRESET", "ultrafast")
+FFMPEG_CRF = os.environ.get("DRONERIS_FFMPEG_CRF", "24")
 
 origins_raw = os.environ.get(
     "ALLOWED_ORIGINS",
@@ -210,26 +218,32 @@ def zoom_factor(scene: dict[str, Any]) -> float:
 def render_scene(source: Path, scene: dict[str, Any], output: Path) -> None:
     start = max(0.0, float(scene.get("start", 0)))
     end = max(start + 0.05, float(scene.get("end", start + 1)))
+    duration = max(0.05, end - start)
     speed = min(2.0, max(0.5, float(scene.get("speed", 1.0) or 1.0)))
     zoom = zoom_factor(scene)
 
+    w, h = RENDER_WIDTH, RENDER_HEIGHT
     filters = [
-        "scale=1920:1080:force_original_aspect_ratio=increase",
-        "crop=1920:1080",
+        f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=fast_bilinear",
+        f"crop={w}:{h}",
     ]
     if zoom > 1.0001:
-        zw = int(round(1920 * zoom / 2) * 2)
-        zh = int(round(1080 * zoom / 2) * 2)
-        filters += [f"scale={zw}:{zh}", "crop=1920:1080"]
+        zw = int(round(w * zoom / 2) * 2)
+        zh = int(round(h * zoom / 2) * 2)
+        filters += [f"scale={zw}:{zh}:flags=fast_bilinear", f"crop={w}:{h}"]
     if abs(speed - 1.0) > 1e-3:
         filters.append(f"setpts=PTS/{speed:.6f}")
-    filters.append("fps=30")
+    filters.append(f"fps={RENDER_FPS}")
 
     args = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(source),
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-threads", str(FFMPEG_THREADS),
+        "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(source),
+        "-filter_threads", "1", "-filter_complex_threads", "1",
         "-map", "0:v:0", "-an", "-vf", ",".join(filters),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", str(FFMPEG_CRF),
+        "-threads", str(FFMPEG_THREADS),
+        "-x264-params", f"threads={FFMPEG_THREADS}:lookahead_threads=1:sliced_threads=0",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output),
     ]
     run_cmd(args, timeout=1800)
@@ -268,6 +282,7 @@ def do_render(job_dir: Path, plan: dict[str, Any], music_path: Path | None) -> N
         source = job_dir / "source.mp4"
         if not source.exists():
             raise RuntimeError("SOURCE_VIDEO_MISSING")
+        print(f"[DRONERIS] render start job={job_dir.name} profile={RENDER_WIDTH}x{RENDER_HEIGHT}@{RENDER_FPS} threads={FFMPEG_THREADS}", flush=True)
         scenes = [s for s in (plan.get("scenes") or []) if s.get("enabled", True)]
         if not scenes:
             raise RuntimeError("NO_ENABLED_SCENES")
@@ -278,7 +293,9 @@ def do_render(job_dir: Path, plan: dict[str, Any], music_path: Path | None) -> N
         count = len(scenes)
         for idx, scene in enumerate(scenes, 1):
             clip = work / f"clip_{idx:03d}.mp4"
+            print(f"[DRONERIS] job={job_dir.name} scene={idx}/{count} start", flush=True)
             render_scene(source, scene, clip)
+            print(f"[DRONERIS] job={job_dir.name} scene={idx}/{count} done", flush=True)
             clips.append(clip)
             write_state(job_dir, renderProgress=int(5 + 70 * idx / count))
         assembled = work / "assembled.mp4"
@@ -290,6 +307,7 @@ def do_render(job_dir: Path, plan: dict[str, Any], music_path: Path | None) -> N
         else:
             shutil.copy2(assembled, final)
         meta = ffprobe_json(final)
+        print(f"[DRONERIS] render complete job={job_dir.name}", flush=True)
         write_state(
             job_dir,
             renderStatus="COMPLETED",
@@ -297,6 +315,7 @@ def do_render(job_dir: Path, plan: dict[str, Any], music_path: Path | None) -> N
             final={"name": final.name, "durationSec": meta.get("durationSec"), "sizeBytes": final.stat().st_size},
         )
     except Exception as e:
+        print(f"[DRONERIS] render failed job={job_dir.name} error={type(e).__name__}:{e}", flush=True)
         write_state(job_dir, renderStatus="FAILED", renderProgress=0, error=f"{type(e).__name__}: {e}")
 
 
@@ -317,6 +336,10 @@ def root() -> dict[str, Any]:
         "version": APP_VERSION,
         "status": "ONLINE",
         "coreIsolation": "READ_ONLY_NO_MISSION_WRITEBACK",
+        "renderProfile": {
+            "width": RENDER_WIDTH, "height": RENDER_HEIGHT, "fps": RENDER_FPS,
+            "ffmpegThreads": FFMPEG_THREADS, "preset": FFMPEG_PRESET, "crf": FFMPEG_CRF,
+        },
     }
 
 
