@@ -482,7 +482,80 @@ def download(job_id: str) -> FileResponse:
         headers={"Cache-Control": "private, no-store"},
     )
 
+@app.post("/api/ai/pilot")
+async def ai_pilot(request: Request) -> JSONResponse:
+    if openai_client is None:
+        raise HTTPException(status_code=503, detail="OPENAI_NOT_CONFIGURED")
 
+    body = await request.json()
+
+    question = str(body.get("question") or "").strip()
+    selected_shot = body.get("selectedShot")
+    timeline = body.get("timeline") or []
+
+    if not question:
+        raise HTTPException(status_code=400, detail="QUESTION_REQUIRED")
+
+    system_prompt = """
+You are DRONERIS AI PILOT, an AI film-editing assistant for drone real-estate videos.
+
+Your job is to interpret the user's editing request and return a concise editing recommendation.
+
+Important:
+- Never modify the original source video.
+- Prefer simple edit actions.
+- Supported actions are:
+  SHORTEN
+  EXTEND
+  SPEED
+  ZOOM
+  NONE
+- If a selected shot exists, assume the request refers to that shot unless the user clearly refers to the whole film.
+- Keep the response concise.
+- Return JSON only.
+"""
+
+    user_payload = {
+        "question": question,
+        "selectedShot": selected_shot,
+        "timeline": timeline,
+    }
+
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(user_payload, ensure_ascii=False),
+                },
+            ],
+        )
+
+        text = response.output_text.strip()
+
+        try:
+            result = json.loads(text)
+        except Exception:
+            result = {
+                "reply": text,
+                "action": "NONE",
+            }
+
+        return JSONResponse({
+            "ok": True,
+            "result": result,
+        })
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OPENAI_PILOT_FAILED:{type(e).__name__}:{e}",
+        )
 @app.exception_handler(Exception)
 async def unhandled_error(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"ok": False, "detail": f"UNHANDLED:{type(exc).__name__}"})
