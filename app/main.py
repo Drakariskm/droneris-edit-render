@@ -11,12 +11,16 @@ import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
-
+from openai import OpenAI
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.1.0_FREE_SAFE"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 ROOT = Path(os.environ.get("DRONERIS_JOB_ROOT", "/tmp/droneris_render_jobs"))
 ROOT.mkdir(parents=True, exist_ok=True)
 TTL_SECONDS = int(os.environ.get("DRONERIS_JOB_TTL_SECONDS", "21600"))  # 6 h
