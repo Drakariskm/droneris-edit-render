@@ -398,6 +398,18 @@ async def create_job(
             await save_upload(manifest, mp)
             extras["manifest"] = {"name": mp.name, "readOnly": True}
         scenes = build_first_cut(float(meta["durationSec"]))
+
+        scenes, ai_director = improve_first_cut_with_ai(
+            openai_client=openai_client,
+            model=OPENAI_MODEL,
+            duration=float(meta["durationSec"]),
+            scenes=scenes,
+            source_type=source_type,
+            style=style,
+        )
+
+        extras["aiDirector"] = ai_director
+
         state = write_state(
             job_dir,
             status="READY",
