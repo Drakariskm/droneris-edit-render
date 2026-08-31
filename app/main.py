@@ -12,7 +12,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 from openai import OpenAI
-from director import improve_first_cut_with_ai
+from app.director import improve_first_cut_with_ai
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
