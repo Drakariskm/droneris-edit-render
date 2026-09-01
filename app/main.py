@@ -19,7 +19,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.1.2_VISION_ANALYSIS_R2_FREE_SAFE"
+APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.1.3_VISION_DIRECTOR_R2_FREE_SAFE"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
 
@@ -528,6 +528,7 @@ async def create_job(
             scenes=scenes,
             source_type=source_type,
             style=style,
+            vision_analysis=extras.get("aiVision"),
         )
 
         extras["aiDirector"] = ai_director
