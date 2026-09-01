@@ -14,12 +14,12 @@ from typing import Any
 
 from openai import OpenAI
 from app.director import improve_first_cut_with_ai
-from app.vision import build_vision_sample_manifest
+from app.vision import build_vision_sample_manifest, analyze_sampled_frames_with_openai
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.1.1_VISION_SAMPLER_R2_FREE_SAFE"
+APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.1.2_VISION_ANALYSIS_R2_FREE_SAFE"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
 
@@ -444,6 +444,47 @@ async def create_job(
 
             if sampler_ok:
                 warnings.append("VISION_FRAME_SAMPLER_PASS")
+
+                # AI VISION DIRECTOR R2 — Phase 2.
+                # Analyze the 16 sampled images with OpenAI Vision.
+                # Fail-open contract: Vision analysis must never stop R1.
+                try:
+                    vision_analysis = await asyncio.to_thread(
+                        analyze_sampled_frames_with_openai,
+                        openai_client=openai_client,
+                        model=OPENAI_MODEL,
+                        sample_manifest=vision_manifest,
+                        source_type=source_type,
+                        style=style,
+                    )
+
+                    extras["aiVision"] = vision_analysis
+
+                    if vision_analysis.get("status") == "VISION_ANALYSIS_PASS":
+                        warnings = [
+                            w for w in warnings
+                            if w != "AI_VISION_NOT_CONNECTED_YET"
+                        ]
+                        warnings.append("VISION_ANALYSIS_PASS")
+                    else:
+                        warnings.append(
+                            str(vision_analysis.get("status") or "VISION_ANALYSIS_WARNING")
+                        )
+
+                except Exception as vision_error:
+                    print(
+                        f"[DRONERIS] vision analysis warning job={job_id} "
+                        f"error={type(vision_error).__name__}:{vision_error}",
+                        flush=True,
+                    )
+                    extras["aiVision"] = {
+                        "enabled": False,
+                        "status": "VISION_ANALYSIS_WARNING",
+                        "visionConnected": False,
+                        "warning": f"{type(vision_error).__name__}:{vision_error}",
+                    }
+                    warnings.append("VISION_ANALYSIS_WARNING")
+
             else:
                 warnings.append("VISION_FRAME_SAMPLER_INCOMPLETE")
 
