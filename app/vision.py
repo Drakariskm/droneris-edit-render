@@ -1,15 +1,23 @@
 """
 DRONERIS AI VISION DIRECTOR R2
 Phase 1: deterministic FFmpeg frame sampler.
+Phase 2: OpenAI Vision analysis of the 16 sampled frames.
 
 Contract:
-    MP4 -> ffprobe metadata -> 16 evenly distributed JPEG frames
+    MP4
+      -> ffprobe metadata
+      -> 16 evenly distributed JPEG frames
+      -> OpenAI Vision structured analysis
 
-OpenAI Vision is intentionally NOT connected in this phase.
+Important:
+- Existing sampler API is preserved.
+- AI EDIT DIRECTOR R1 is not modified here.
+- This module only analyzes; it does not change edit scenes.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import shutil
@@ -20,10 +28,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 
-DRONERIS_VISION_VERSION = "DRONERIS_AI_VISION_DIRECTOR_R2_FRAME_SAMPLER_2026_09_01"
+DRONERIS_VISION_VERSION = "DRONERIS_AI_VISION_DIRECTOR_R2_2026_09_01"
+DRONERIS_VISION_SAMPLER_VERSION = "DRONERIS_AI_VISION_DIRECTOR_R2_FRAME_SAMPLER_2026_09_01"
+
 DEFAULT_FRAME_COUNT = 16
 DEFAULT_JPEG_QUALITY = 2
 DEFAULT_SCALE_WIDTH = 1280
+DEFAULT_IMAGE_DETAIL = "low"
 SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 
 
@@ -41,6 +52,10 @@ class VideoProbeError(VisionSamplerError):
 
 class FrameSamplingError(VisionSamplerError):
     """Raised when one or more requested frames cannot be extracted."""
+
+
+class VisionAnalysisError(RuntimeError):
+    """Raised when OpenAI Vision analysis cannot be completed reliably."""
 
 
 @dataclass(frozen=True)
@@ -133,11 +148,6 @@ def _parse_fraction(value: Optional[str]) -> Optional[float]:
 
 
 def probe_video(video_path: Union[str, Path]) -> VideoInfo:
-    """
-    Read stable metadata using ffprobe.
-
-    Duration is resolved from format.duration first, then stream.duration.
-    """
     path = Path(video_path).expanduser().resolve()
     if not path.is_file():
         raise VideoProbeError(f"Video file does not exist: {path}")
@@ -175,12 +185,8 @@ def probe_video(video_path: Union[str, Path]) -> VideoInfo:
 
     format_info = payload.get("format") or {}
 
-    duration_candidates = [
-        format_info.get("duration"),
-        video_stream.get("duration"),
-    ]
     duration_s = None
-    for candidate in duration_candidates:
+    for candidate in (format_info.get("duration"), video_stream.get("duration")):
         try:
             value = float(candidate)
             if math.isfinite(value) and value > 0:
@@ -218,12 +224,7 @@ def evenly_spaced_timestamps(
     frame_count: int = DEFAULT_FRAME_COUNT,
 ) -> List[float]:
     """
-    Return timestamps centered inside equal-duration bins.
-
-    For N=16 the video is divided into 16 equal temporal segments and one
-    frame is sampled from the center of each segment. This avoids depending
-    on the possibly-black first frame or an incomplete last frame while still
-    covering the complete clip uniformly.
+    Divide the full duration into N equal bins and sample the center of each bin.
     """
     if frame_count <= 0:
         raise ValueError("frame_count must be greater than zero")
@@ -231,12 +232,10 @@ def evenly_spaced_timestamps(
         raise ValueError("duration_s must be a positive finite number")
 
     segment = duration_s / frame_count
-
-    # For extremely short videos, stay a tiny distance away from exact EOF.
     eof_guard = min(0.001, duration_s * 0.001)
     last_safe = max(0.0, duration_s - eof_guard)
 
-    timestamps = []
+    timestamps: List[float] = []
     for i in range(frame_count):
         ts = (i + 0.5) * segment
         ts = min(max(0.0, ts), last_safe)
@@ -258,7 +257,6 @@ def _extract_frame(
 
     vf: List[str] = []
     if scale_width:
-        # -2 preserves aspect ratio while keeping an even dimension.
         vf.append(f"scale={int(scale_width)}:-2")
 
     cmd = [
@@ -301,16 +299,6 @@ def sample_frames(
     overwrite: bool = True,
     timeout_per_frame_s: int = 30,
 ) -> FrameSampleResult:
-    """
-    Extract exactly `frame_count` evenly distributed JPEG frames.
-
-    Default R2 contract:
-        frame_count = 16
-        scale_width = 1280
-        format = JPEG
-
-    If `output_dir` is omitted, a persistent temporary directory is created.
-    """
     video = probe_video(video_path)
     source = Path(video.path)
 
@@ -360,7 +348,7 @@ def sample_frames(
         )
 
     return FrameSampleResult(
-        version=DRONERIS_VISION_VERSION,
+        version=DRONERIS_VISION_SAMPLER_VERSION,
         source=str(source),
         frame_count=frame_count,
         video=video,
@@ -375,9 +363,7 @@ def build_vision_sample_manifest(
     frame_count: int = DEFAULT_FRAME_COUNT,
 ) -> Dict[str, Any]:
     """
-    Convenience entry point for the future AI Vision Director.
-
-    Returns JSON-serializable metadata and frame paths.
+    Existing Phase 1 entry point. Preserved for backward compatibility.
     No OpenAI request is made here.
     """
     result = sample_frames(
@@ -391,13 +377,353 @@ def build_vision_sample_manifest(
     return payload
 
 
+def _image_to_data_url(path: Union[str, Path]) -> str:
+    p = Path(path)
+    if not p.is_file() or p.stat().st_size <= 0:
+        raise VisionAnalysisError(f"Vision frame is missing or empty: {p}")
+    encoded = base64.b64encode(p.read_bytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    raw = (text or "").strip()
+    if not raw:
+        raise VisionAnalysisError("OpenAI Vision returned empty output.")
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Defensive fallback for a model response wrapped in a markdown code fence.
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].lstrip()
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    raise VisionAnalysisError("OpenAI Vision output was not valid JSON.")
+
+
+def _clamp_number(value: Any, low: float, high: float, default: float) -> float:
+    try:
+        x = float(value)
+        if not math.isfinite(x):
+            return default
+        return max(low, min(high, x))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_vision_result(
+    result: Dict[str, Any],
+    *,
+    expected_frames: Sequence[Dict[str, Any]],
+    model: str,
+) -> Dict[str, Any]:
+    by_index: Dict[int, Dict[str, Any]] = {}
+    for item in result.get("frames") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        by_index[idx] = item
+
+    normalized_frames: List[Dict[str, Any]] = []
+
+    for expected in expected_frames:
+        idx = int(expected["index"])
+        ts = float(expected["timestampSec"])
+        item = by_index.get(idx, {})
+
+        recommended_use = str(item.get("recommendedUse") or "NONE").upper().strip()
+        if recommended_use not in {
+            "REVEAL",
+            "HERO",
+            "PRIMARY_MOVEMENT",
+            "DETAIL",
+            "SECONDARY_MOVEMENT",
+            "FINAL_HERO",
+            "EXIT",
+            "CONTEXT",
+            "NONE",
+        }:
+            recommended_use = "NONE"
+
+        composition = str(item.get("composition") or "UNKNOWN").upper().strip()
+        if composition not in {"STRONG", "GOOD", "FAIR", "WEAK", "UNKNOWN"}:
+            composition = "UNKNOWN"
+
+        obstruction = str(item.get("obstruction") or "UNKNOWN").upper().strip()
+        if obstruction not in {"NONE", "LOW", "MEDIUM", "HIGH", "UNKNOWN"}:
+            obstruction = "UNKNOWN"
+
+        normalized_frames.append({
+            "index": idx,
+            "timestampSec": round(ts, 3),
+            "subjectVisible": bool(item.get("subjectVisible", False)),
+            "subjectOccupancy": round(
+                _clamp_number(item.get("subjectOccupancy"), 0.0, 1.0, 0.0),
+                3,
+            ),
+            "composition": composition,
+            "obstruction": obstruction,
+            "heroPotential": int(round(
+                _clamp_number(item.get("heroPotential"), 0.0, 100.0, 0.0)
+            )),
+            "detailPotential": int(round(
+                _clamp_number(item.get("detailPotential"), 0.0, 100.0, 0.0)
+            )),
+            "movementQuality": int(round(
+                _clamp_number(item.get("movementQuality"), 0.0, 100.0, 50.0)
+            )),
+            "recommendedZoom": round(
+                _clamp_number(item.get("recommendedZoom"), 1.0, 1.35, 1.0),
+                2,
+            ),
+            "recommendedUse": recommended_use,
+            "reason": str(item.get("reason") or "")[:220],
+        })
+
+    visible = [f for f in normalized_frames if f["subjectVisible"]]
+    vision_score = int(round(_clamp_number(result.get("visionScore"), 0.0, 100.0, 0.0)))
+    if vision_score == 0 and normalized_frames:
+        raw_scores = [
+            (f["heroPotential"] * 0.40)
+            + (f["movementQuality"] * 0.35)
+            + ((100 if f["composition"] in {"STRONG", "GOOD"} else 50) * 0.25)
+            for f in normalized_frames
+        ]
+        vision_score = int(round(sum(raw_scores) / len(raw_scores)))
+
+    return {
+        "enabled": True,
+        "status": "VISION_ANALYSIS_PASS",
+        "visionConnected": True,
+        "version": DRONERIS_VISION_VERSION,
+        "model": model,
+        "visionScore": max(0, min(100, vision_score)),
+        "subjectVisibleFrameCount": len(visible),
+        "frameCount": len(normalized_frames),
+        "summary": str(result.get("summary") or "")[:700],
+        "frames": normalized_frames,
+    }
+
+
+def analyze_sampled_frames_with_openai(
+    *,
+    openai_client: Any,
+    model: str,
+    sample_manifest: Dict[str, Any],
+    source_type: str = "REAL_FLIGHT",
+    style: str = "clean_real_estate",
+    image_detail: str = DEFAULT_IMAGE_DETAIL,
+) -> Dict[str, Any]:
+    """
+    Analyze the already-sampled 16 JPEG frames with OpenAI Vision.
+
+    This function DOES NOT modify edit scenes.
+    It returns structured visual evidence for a later Director step.
+    """
+    if openai_client is None:
+        return {
+            "enabled": False,
+            "status": "VISION_NOT_CONFIGURED",
+            "visionConnected": False,
+            "version": DRONERIS_VISION_VERSION,
+            "frameCount": 0,
+        }
+
+    raw_frames = sample_manifest.get("frames") or []
+    if len(raw_frames) != DEFAULT_FRAME_COUNT:
+        raise VisionAnalysisError(
+            f"Expected {DEFAULT_FRAME_COUNT} sampled frames, got {len(raw_frames)}."
+        )
+
+    prepared_frames: List[Dict[str, Any]] = []
+    content: List[Dict[str, Any]] = []
+
+    prompt = f"""
+You are DRONERIS AI VISION DIRECTOR R2.
+
+Analyze 16 uniformly sampled frames from one drone real-estate video.
+
+SOURCE TYPE: {source_type}
+EDIT STYLE: {style}
+
+The images are ordered chronologically from frame 1 to frame 16.
+
+Your task is visual analysis only. Do not invent motion that cannot be inferred from adjacent sampled frames.
+Evaluate what is visibly present in each frame and how useful it is for film editing.
+
+For every frame return:
+- index: 1..16
+- subjectVisible: true/false
+- subjectOccupancy: approximate fraction of frame height occupied by the principal property/subject, 0.0..1.0
+- composition: STRONG | GOOD | FAIR | WEAK | UNKNOWN
+- obstruction: NONE | LOW | MEDIUM | HIGH | UNKNOWN
+- heroPotential: 0..100
+- detailPotential: 0..100
+- movementQuality: 0..100
+  This may use adjacent-frame visual progression, but do not claim exact optical-flow measurement.
+- recommendedZoom: 1.00..1.35
+- recommendedUse:
+  REVEAL | HERO | PRIMARY_MOVEMENT | DETAIL | SECONDARY_MOVEMENT |
+  FINAL_HERO | EXIT | CONTEXT | NONE
+- reason: one concise sentence
+
+Also return:
+- visionScore: 0..100 overall visual usefulness
+- summary: concise visual assessment of the footage
+
+Rules:
+- Prefer conservative judgments.
+- If the property is too small, lower heroPotential and suggest modest zoom.
+- If trees/objects obscure the property, reflect that in obstruction.
+- Do not classify a frame as HERO merely because of its position in the video.
+- Do not assume a building is visible unless it is actually visible.
+- Do not alter timestamps or create edit cuts.
+- Return JSON only.
+
+Exact JSON shape:
+{{
+  "visionScore": 0,
+  "summary": "",
+  "frames": [
+    {{
+      "index": 1,
+      "subjectVisible": true,
+      "subjectOccupancy": 0.0,
+      "composition": "GOOD",
+      "obstruction": "NONE",
+      "heroPotential": 0,
+      "detailPotential": 0,
+      "movementQuality": 0,
+      "recommendedZoom": 1.0,
+      "recommendedUse": "NONE",
+      "reason": ""
+    }}
+  ]
+}}
+""".strip()
+
+    content.append({"type": "input_text", "text": prompt})
+
+    for frame in raw_frames:
+        try:
+            idx = int(frame.get("index"))
+            ts = float(frame.get("timestamp_s"))
+            path = str(frame.get("path") or "")
+        except (TypeError, ValueError) as exc:
+            raise VisionAnalysisError("Invalid sampled frame metadata.") from exc
+
+        prepared_frames.append({
+            "index": idx,
+            "timestampSec": ts,
+            "path": path,
+        })
+
+        content.append({
+            "type": "input_text",
+            "text": f"FRAME {idx:02d} — timestamp {ts:.3f}s",
+        })
+        content.append({
+            "type": "input_image",
+            "image_url": _image_to_data_url(path),
+            "detail": image_detail,
+        })
+
+    try:
+        response = openai_client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ],
+        )
+    except Exception as exc:
+        raise VisionAnalysisError(
+            f"OpenAI Vision request failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    try:
+        output_text = response.output_text
+    except Exception as exc:
+        raise VisionAnalysisError("OpenAI response did not expose output_text.") from exc
+
+    parsed = _extract_json_object(output_text)
+
+    return _normalize_vision_result(
+        parsed,
+        expected_frames=prepared_frames,
+        model=model,
+    )
+
+
+def sample_and_analyze_with_openai(
+    *,
+    video_path: Union[str, Path],
+    output_dir: Union[str, Path],
+    openai_client: Any,
+    model: str,
+    frame_count: int = DEFAULT_FRAME_COUNT,
+    source_type: str = "REAL_FLIGHT",
+    style: str = "clean_real_estate",
+    image_detail: str = DEFAULT_IMAGE_DETAIL,
+) -> Dict[str, Any]:
+    """
+    Convenience function for the complete R2 visual-analysis pipeline.
+
+    MP4 -> 16 frames -> OpenAI Vision -> structured JSON
+
+    Still does NOT modify AI EDIT DIRECTOR scenes.
+    """
+    manifest = build_vision_sample_manifest(
+        video_path=video_path,
+        output_dir=output_dir,
+        frame_count=frame_count,
+    )
+
+    vision = analyze_sampled_frames_with_openai(
+        openai_client=openai_client,
+        model=model,
+        sample_manifest=manifest,
+        source_type=source_type,
+        style=style,
+        image_detail=image_detail,
+    )
+
+    return {
+        "sampler": manifest,
+        "vision": vision,
+    }
+
+
 __all__ = [
     "DRONERIS_VISION_VERSION",
+    "DRONERIS_VISION_SAMPLER_VERSION",
     "DEFAULT_FRAME_COUNT",
     "VisionSamplerError",
     "FFmpegNotFoundError",
     "VideoProbeError",
     "FrameSamplingError",
+    "VisionAnalysisError",
     "VideoInfo",
     "SampledFrame",
     "FrameSampleResult",
@@ -405,4 +731,6 @@ __all__ = [
     "evenly_spaced_timestamps",
     "sample_frames",
     "build_vision_sample_manifest",
+    "analyze_sampled_frames_with_openai",
+    "sample_and_analyze_with_openai",
 ]
