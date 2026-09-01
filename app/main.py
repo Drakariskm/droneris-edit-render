@@ -11,13 +11,15 @@ import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
+
 from openai import OpenAI
 from app.director import improve_first_cut_with_ai
+from app.vision import build_vision_sample_manifest
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.1.0_FREE_SAFE"
+APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.1.1_VISION_SAMPLER_R2_FREE_SAFE"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
 
@@ -374,29 +376,108 @@ async def create_job(
     ext = Path(video.filename or "").suffix.lower()
     if ext not in {".mp4", ".mov", ".m4v"}:
         raise HTTPException(status_code=415, detail="VIDEO_FORMAT_NOT_SUPPORTED")
+
     job_id = uuid.uuid4().hex
     job_dir = ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=False)
     source_path = job_dir / "source.mp4"
-    write_state(job_dir, jobId=job_id, status="UPLOADING", renderStatus="NOT_STARTED", createdAt=time.time())
+
+    write_state(
+        job_dir,
+        jobId=job_id,
+        status="UPLOADING",
+        renderStatus="NOT_STARTED",
+        createdAt=time.time(),
+    )
+
     try:
         size = await save_upload(video, source_path)
         meta = ffprobe_json(source_path)
+
         if not meta.get("durationSec"):
             raise HTTPException(status_code=422, detail="VIDEO_DURATION_UNAVAILABLE")
+
         extras: dict[str, Any] = {}
+        warnings = [
+            "R1_DIRECTOR_BASELINE_SERVER_SIDE",
+            "AI_VISION_NOT_CONNECTED_YET",
+        ]
+
+        # AI VISION DIRECTOR R2 — Phase 1 only.
+        # Extract exactly 16 evenly distributed frames.
+        # Fail-open contract: an R2 sampler problem must never stop R1.
+        try:
+            vision_frames_dir = job_dir / "vision_frames"
+            vision_manifest = await asyncio.to_thread(
+                build_vision_sample_manifest,
+                source_path,
+                vision_frames_dir,
+                frame_count=16,
+            )
+
+            sampled_frames = vision_manifest.get("frames") or []
+            safe_frames: list[dict[str, Any]] = []
+
+            for frame in sampled_frames:
+                frame_path = Path(str(frame.get("path") or ""))
+                safe_frames.append({
+                    "index": frame.get("index"),
+                    "timestampSec": frame.get("timestamp_s"),
+                    "file": frame_path.name,
+                    "sizeBytes": frame_path.stat().st_size if frame_path.is_file() else 0,
+                })
+
+            sampler_ok = (
+                vision_manifest.get("status") == "FRAME_SAMPLER_PASS"
+                and len(safe_frames) == 16
+                and all(int(f.get("sizeBytes") or 0) > 0 for f in safe_frames)
+            )
+
+            extras["aiVisionSampler"] = {
+                "enabled": True,
+                "status": "FRAME_SAMPLER_PASS" if sampler_ok else "FRAME_SAMPLER_INCOMPLETE",
+                "version": vision_manifest.get("version"),
+                "frameCount": len(safe_frames),
+                "visionConnected": False,
+                "frames": safe_frames,
+            }
+
+            if sampler_ok:
+                warnings.append("VISION_FRAME_SAMPLER_PASS")
+            else:
+                warnings.append("VISION_FRAME_SAMPLER_INCOMPLETE")
+
+        except Exception as e:
+            print(
+                f"[DRONERIS] vision sampler warning job={job_id} "
+                f"error={type(e).__name__}:{e}",
+                flush=True,
+            )
+
+            extras["aiVisionSampler"] = {
+                "enabled": False,
+                "status": "FRAME_SAMPLER_WARNING",
+                "frameCount": 0,
+                "visionConnected": False,
+                "warning": f"{type(e).__name__}:{e}",
+            }
+            warnings.append("VISION_FRAME_SAMPLER_WARNING")
+
         if kmz is not None and kmz.filename:
             kp = job_dir / safe_name(kmz.filename, "mission.kmz")
             await save_upload(kmz, kp)
             extras["kmz"] = parse_kmz_summary(kp)
+
         if srt is not None and srt.filename:
             sp = job_dir / safe_name(srt.filename, "telemetry.srt")
             await save_upload(srt, sp)
             extras["srt"] = {"name": sp.name, "readOnly": True}
+
         if manifest is not None and manifest.filename:
             mp = job_dir / safe_name(manifest.filename, "manifest.json")
             await save_upload(manifest, mp)
             extras["manifest"] = {"name": mp.name, "readOnly": True}
+
         scenes = build_first_cut(float(meta["durationSec"]))
 
         scenes, ai_director = improve_first_cut_with_ai(
@@ -413,13 +494,19 @@ async def create_job(
         state = write_state(
             job_dir,
             status="READY",
-            source={"name": safe_name(video.filename, "source.mp4"), "sourceType": source_type, "sizeBytes": size, **meta},
+            source={
+                "name": safe_name(video.filename, "source.mp4"),
+                "sourceType": source_type,
+                "sizeBytes": size,
+                **meta,
+            },
             missionId=mission_id,
             style=style,
             extras=extras,
             scenes=scenes,
             coreIsolation="READ_ONLY_NO_MISSION_WRITEBACK",
         )
+
         return JSONResponse({
             "ok": True,
             "jobId": job_id,
@@ -428,17 +515,26 @@ async def create_job(
             "missionId": mission_id,
             "extras": extras,
             "scenes": scenes,
-            "warnings": ["R1_DIRECTOR_BASELINE_SERVER_SIDE", "AI_VISION_NOT_CONNECTED_YET"],
+            "warnings": warnings,
         })
+
     except HTTPException:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
+
     except subprocess.CalledProcessError as e:
         shutil.rmtree(job_dir, ignore_errors=True)
-        raise HTTPException(status_code=422, detail=f"MEDIA_PROBE_FAILED:{e.stderr[-300:] if e.stderr else ''}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"MEDIA_PROBE_FAILED:{e.stderr[-300:] if e.stderr else ''}",
+        )
+
     except Exception as e:
         shutil.rmtree(job_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"JOB_CREATE_FAILED:{type(e).__name__}:{e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"JOB_CREATE_FAILED:{type(e).__name__}:{e}",
+        )
 
 
 @app.get("/api/jobs/{job_id}")
@@ -458,42 +554,58 @@ async def start_render(
 ) -> JSONResponse:
     if not re.fullmatch(r"[0-9a-f]{32}", job_id):
         raise HTTPException(status_code=400, detail="INVALID_JOB_ID")
+
     job_dir = ROOT / job_id
     state = load_state(job_dir)
+
     if state.get("renderStatus") in {"QUEUED", "PROCESSING"}:
         raise HTTPException(status_code=409, detail="RENDER_ALREADY_RUNNING")
+
     try:
         plan_obj = json.loads(plan)
     except Exception:
         raise HTTPException(status_code=400, detail="INVALID_EDIT_PLAN_JSON")
+
     if not isinstance(plan_obj, dict) or not isinstance(plan_obj.get("scenes"), list):
         raise HTTPException(status_code=400, detail="EDIT_PLAN_SCENES_REQUIRED")
+
     music_path: Path | None = None
     if music is not None and music.filename:
         music_path = job_dir / safe_name(music.filename, "music.mp3")
         await save_upload(music, music_path)
+
     write_state(job_dir, renderStatus="QUEUED", renderProgress=1, error=None)
     background_tasks.add_task(render_worker, job_dir, plan_obj, music_path)
-    return JSONResponse({"ok": True, "jobId": job_id, "renderStatus": "QUEUED"}, status_code=202)
+
+    return JSONResponse(
+        {"ok": True, "jobId": job_id, "renderStatus": "QUEUED"},
+        status_code=202,
+    )
 
 
 @app.get("/api/jobs/{job_id}/download")
 def download(job_id: str) -> FileResponse:
     if not re.fullmatch(r"[0-9a-f]{32}", job_id):
         raise HTTPException(status_code=400, detail="INVALID_JOB_ID")
+
     job_dir = ROOT / job_id
     state = load_state(job_dir)
+
     if state.get("renderStatus") != "COMPLETED":
         raise HTTPException(status_code=409, detail="RENDER_NOT_COMPLETED")
+
     final = job_dir / "DRONERIS_FINAL.mp4"
+
     if not final.exists():
         raise HTTPException(status_code=404, detail="FINAL_VIDEO_MISSING")
+
     return FileResponse(
         final,
         media_type="video/mp4",
         filename=f"{state.get('missionId') or 'DRONERIS'}_FINAL.mp4",
         headers={"Cache-Control": "private, no-store"},
     )
+
 
 @app.post("/api/ai/pilot")
 async def ai_pilot(request: Request) -> JSONResponse:
@@ -569,6 +681,11 @@ Important:
             status_code=502,
             detail=f"OPENAI_PILOT_FAILED:{type(e).__name__}:{e}",
         )
+
+
 @app.exception_handler(Exception)
 async def unhandled_error(request: Request, exc: Exception):
-    return JSONResponse(status_code=500, content={"ok": False, "detail": f"UNHANDLED:{type(exc).__name__}"})
+    return JSONResponse(
+        status_code=500,
+        content={"ok": False, "detail": f"UNHANDLED:{type(exc).__name__}"},
+    )
