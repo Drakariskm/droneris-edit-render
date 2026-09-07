@@ -19,7 +19,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.2.0_MULTI_SOURCE_M1_FREE_SAFE"
+APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.3.0_TRANSITION_R1_FREE_SAFE"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
 
@@ -410,15 +410,102 @@ def render_scene(source: Path, scene: dict[str, Any], output: Path) -> None:
     run_cmd(args, timeout=1800)
 
 
-def assemble_clips(clips: list[Path], output: Path, work_dir: Path) -> None:
-    concat_file = work_dir / "concat.txt"
-    concat_file.write_text("\n".join(f"file '{p.as_posix()}'" for p in clips) + "\n", "utf-8")
-    run_cmd([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "concat", "-safe", "0", "-i", str(concat_file),
-        "-c", "copy", "-movflags", "+faststart", str(output)
-    ], timeout=1800)
+def _transition_spec(scene: dict[str, Any]) -> tuple[str, float]:
+    """Return normalized transition after this scene: CUT/CROSSFADE/DISSOLVE/DIP_BLACK."""
+    raw = scene.get("transitionOut")
+    if isinstance(raw, dict):
+        name = str(raw.get("type") or raw.get("name") or "CUT")
+        duration = raw.get("duration", raw.get("durationSec", 0.6))
+    else:
+        name = str(raw or scene.get("transition") or "CUT")
+        duration = scene.get("transitionDuration", scene.get("transitionDurationSec", 0.6))
+    key = re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")
+    aliases = {"FADE": "CROSSFADE", "CROSS_FADE": "CROSSFADE", "DIPBLACK": "DIP_BLACK", "FADE_BLACK": "DIP_BLACK"}
+    key = aliases.get(key, key)
+    if key not in {"CUT", "CROSSFADE", "DISSOLVE", "DIP_BLACK"}:
+        key = "CUT"
+    try:
+        duration = float(duration)
+    except Exception:
+        duration = 0.6
+    duration = min(1.5, max(0.10, duration))
+    return key, duration
 
+
+def _global_fades(plan: dict[str, Any]) -> tuple[float, float]:
+    def read(name: str, default: float) -> float:
+        raw = plan.get(name, default)
+        if isinstance(raw, bool):
+            return default if raw else 0.0
+        if isinstance(raw, dict):
+            if raw.get("enabled") is False:
+                return 0.0
+            raw = raw.get("duration", raw.get("durationSec", default))
+        try:
+            return min(3.0, max(0.0, float(raw)))
+        except Exception:
+            return default
+    return read("fadeIn", 0.8), read("fadeOut", 1.2)
+
+
+def assemble_clips(clips: list[Path], scenes: list[dict[str, Any]], output: Path, work_dir: Path, plan: dict[str, Any]) -> None:
+    if not clips:
+        raise RuntimeError("NO_RENDERED_CLIPS")
+    durations = [float(ffprobe_json(p).get("durationSec") or 0.0) for p in clips]
+    if any(d <= 0.05 for d in durations):
+        raise RuntimeError("CLIP_DURATION_UNKNOWN")
+
+    fade_in, fade_out = _global_fades(plan)
+    if len(clips) == 1:
+        total = durations[0]
+        vf = []
+        if fade_in > 0:
+            vf.append(f"fade=t=in:st=0:d={min(fade_in, total/2):.3f}")
+        if fade_out > 0:
+            d = min(fade_out, total/2)
+            vf.append(f"fade=t=out:st={max(0.0,total-d):.3f}:d={d:.3f}")
+        args = ["ffmpeg","-hide_banner","-loglevel","error","-y","-i",str(clips[0])]
+        if vf:
+            args += ["-vf", ",".join(vf), "-c:v","libx264","-preset",FFMPEG_PRESET,"-crf",str(FFMPEG_CRF)]
+        else:
+            args += ["-c:v","copy"]
+        args += ["-an","-pix_fmt","yuv420p","-movflags","+faststart",str(output)]
+        run_cmd(args, timeout=1800)
+        return
+
+    # xfade is used for every join. CUT is represented by a 1 ms fade, visually a hard cut,
+    # which keeps one robust filter graph for mixed transition types.
+    inputs: list[str] = []
+    for clip in clips:
+        inputs += ["-i", str(clip)]
+    chains: list[str] = []
+    cumulative = durations[0]
+    prev = "[0:v]"
+    for i in range(1, len(clips)):
+        kind, requested = _transition_spec(scenes[i-1])
+        td = 0.001 if kind == "CUT" else min(requested, durations[i-1] * 0.45, durations[i] * 0.45)
+        xname = {"CUT":"fade", "CROSSFADE":"fade", "DISSOLVE":"dissolve", "DIP_BLACK":"fadeblack"}[kind]
+        offset = max(0.0, cumulative - td)
+        out = f"[v{i}]"
+        chains.append(f"{prev}[{i}:v]xfade=transition={xname}:duration={td:.3f}:offset={offset:.3f}{out}")
+        cumulative = cumulative + durations[i] - td
+        prev = out
+    final_label = prev
+    fade_filters = []
+    if fade_in > 0:
+        fade_filters.append(f"fade=t=in:st=0:d={min(fade_in,cumulative/2):.3f}")
+    if fade_out > 0:
+        d = min(fade_out, cumulative/2)
+        fade_filters.append(f"fade=t=out:st={max(0.0,cumulative-d):.3f}:d={d:.3f}")
+    if fade_filters:
+        chains.append(f"{prev}{','.join(fade_filters)}[vfinal]")
+        final_label = "[vfinal]"
+    run_cmd([
+        "ffmpeg","-hide_banner","-loglevel","error","-y",*inputs,
+        "-filter_complex_threads","1","-filter_complex",";".join(chains),
+        "-map",final_label,"-an","-c:v","libx264","-preset",FFMPEG_PRESET,"-crf",str(FFMPEG_CRF),
+        "-threads",str(FFMPEG_THREADS),"-pix_fmt","yuv420p","-movflags","+faststart",str(output)
+    ], timeout=1800)
 
 def add_music(video: Path, music: Path, output: Path) -> None:
     meta = ffprobe_json(video)
@@ -485,7 +572,7 @@ def do_render(job_dir: Path, plan: dict[str, Any], music_path: Path | None) -> N
             clips.append(clip)
             write_state(job_dir, renderProgress=int(5 + 70 * idx / count))
         assembled = work / "assembled.mp4"
-        assemble_clips(clips, assembled, work)
+        assemble_clips(clips, scenes, assembled, work, plan)
         write_state(job_dir, renderProgress=82)
         final = job_dir / "DRONERIS_FINAL.mp4"
         if music_path and music_path.exists():
@@ -531,6 +618,9 @@ def root() -> dict[str, Any]:
             "maxSources": MAX_SOURCE_COUNT,
             "sceneSourceId": True,
             "musicUpload": True,
+            "transitionEngine": True,
+            "transitions": ["CUT", "CROSSFADE", "DISSOLVE", "DIP_BLACK"],
+            "fadeInOut": True,
         },
     }
 
