@@ -19,7 +19,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.3.0_TRANSITION_R1_FREE_SAFE"
+APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.4.0_ADAPTIVE_FIRST_CUT_POOL_R1_FREE_SAFE"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
 
@@ -262,22 +262,66 @@ def scene_vision_quality(scene: dict[str, Any], vision: dict[str, Any] | None) -
     return max(0.0, min(100.0, 0.25 * base + 0.60 * visual_avg + 0.15 * source_score))
 
 
-def build_multisource_shared_cut(source_results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Select one editorial grammar scene per role from a shared pool of all sources."""
-    role_order = [
-        "REVEAL",
+def target_first_cut_duration(source_duration: float) -> float:
+    """Return the deterministic First Cut duration target without changing the 75 s product target."""
+    duration = max(1.0, float(source_duration))
+    return min(75.0, max(10.0, duration * 0.90)) if duration < 83.34 else 75.0
+
+
+def adaptive_candidate_count(target_duration: float) -> int:
+    """Build a wider editorial candidate pool instead of the legacy fixed seven slots."""
+    # ~5 s per candidate gives 15 candidates for the standard 75 s First Cut.
+    # Keep bounds conservative for short sources and for Render Free payload size.
+    return max(6, min(18, int(round(max(10.0, float(target_duration)) / 5.0))))
+
+
+def editorial_role_sequence(count: int) -> list[str]:
+    """Create an editorial grammar of arbitrary length while preserving clear opening/closing roles."""
+    count = max(2, int(count))
+    if count == 2:
+        return ["REVEAL", "EXIT"]
+
+    middle_cycle = [
+        "PRIMARY MOVEMENT",
+        "DETAIL / POI",
+        "SECONDARY MOVEMENT",
         "HERO",
         "PRIMARY MOVEMENT",
         "DETAIL / POI",
         "SECONDARY MOVEMENT",
-        "FINAL HERO",
-        "EXIT",
     ]
+    roles = ["REVEAL", "HERO"]
+    middle_slots = max(0, count - 4)
+    roles.extend(middle_cycle[i % len(middle_cycle)] for i in range(middle_slots))
+    roles.extend(["FINAL HERO", "EXIT"])
+    return roles[:count]
+
+
+def scene_label_for_role(role: str, ordinal: int) -> str:
+    base = {
+        "REVEAL": "Reveal",
+        "HERO": "Hero",
+        "PRIMARY MOVEMENT": "Primary movement",
+        "DETAIL / POI": "Detail / POI",
+        "SECONDARY MOVEMENT": "Secondary movement",
+        "FINAL HERO": "Final hero",
+        "EXIT": "Exit / pull-away",
+    }.get(role, role.title())
+    return base if ordinal == 1 else f"{base} {ordinal}"
+
+
+def build_multisource_shared_cut(source_results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select an adaptive editorial sequence from the shared pool of all sources."""
     pool: list[dict[str, Any]] = []
+    total_available = 0.0
     for source in source_results:
         source_id = str(source["sourceId"])
         source_name = str(source.get("name") or source_id)
         vision = source.get("vision")
+        try:
+            total_available += max(0.0, float(source.get("durationSec") or 0.0))
+        except (TypeError, ValueError):
+            pass
         for local_scene in source.get("scenes") or []:
             candidate = dict(local_scene)
             candidate["sourceId"] = source_id
@@ -289,31 +333,52 @@ def build_multisource_shared_cut(source_results: list[dict[str, Any]]) -> tuple[
     if not pool:
         raise RuntimeError("MULTI_SOURCE_SHARED_POOL_EMPTY")
 
+    shared_target = target_first_cut_duration(total_available if total_available > 0 else 75.0)
+    target_count = adaptive_candidate_count(shared_target)
+    role_order = editorial_role_sequence(target_count)
+
     selected: list[dict[str, Any]] = []
     source_use: dict[str, int] = {}
+    used_candidates: set[tuple[str, str]] = set()
     last_source = ""
 
     for role in role_order:
-        candidates = [c for c in pool if str(c.get("type") or "").upper() == role]
+        candidates = []
+        for c in pool:
+            key = (str(c.get("sourceId") or ""), str(c.get("sourceSceneId") or c.get("id") or ""))
+            if key in used_candidates:
+                continue
+            if str(c.get("type") or "").upper() == role:
+                candidates.append(c)
+
+        # If one role is sparse, keep the pool adaptive rather than losing the slot entirely.
         if not candidates:
-            continue
+            candidates = [
+                c for c in pool
+                if (str(c.get("sourceId") or ""), str(c.get("sourceSceneId") or c.get("id") or "")) not in used_candidates
+            ]
+        if not candidates:
+            break
 
         def rank(c: dict[str, Any]) -> float:
             sid = str(c.get("sourceId") or "")
             diversity_bonus = 7.0 if source_use.get(sid, 0) == 0 else max(0.0, 3.0 - source_use.get(sid, 0))
             repeat_penalty = 4.0 if sid == last_source else 0.0
-            return float(c.get("selectionQuality") or 0.0) + diversity_bonus - repeat_penalty
+            role_bonus = 3.0 if str(c.get("type") or "").upper() == role else 0.0
+            return float(c.get("selectionQuality") or 0.0) + diversity_bonus + role_bonus - repeat_penalty
 
         chosen = max(candidates, key=rank)
         chosen = dict(chosen)
         chosen["id"] = len(selected) + 1
-        chosen["revision"] = "MULTI_SOURCE_SHARED_POOL"
+        chosen["revision"] = "MULTI_SOURCE_ADAPTIVE_SHARED_POOL"
         chosen["directorReason"] = (
-            f"Shared-pool {role} selected from {chosen.get('sourceId')} "
+            f"Adaptive shared-pool {role} selected from {chosen.get('sourceId')} "
             f"(quality {float(chosen.get('selectionQuality') or 0):.1f})."
         )
         selected.append(chosen)
         sid = str(chosen.get("sourceId") or "")
+        key = (sid, str(chosen.get("sourceSceneId") or chosen.get("id") or ""))
+        used_candidates.add(key)
         source_use[sid] = source_use.get(sid, 0) + 1
         last_source = sid
 
@@ -322,45 +387,66 @@ def build_multisource_shared_cut(source_results: list[dict[str, Any]]) -> tuple[
 
     return selected, {
         "enabled": True,
-        "mode": "VISION_SCORED_SHARED_POOL_R1",
+        "mode": "VISION_SCORED_ADAPTIVE_SHARED_POOL_R2",
         "sourceCount": len(source_results),
         "candidateCount": len(pool),
+        "targetSceneCount": target_count,
         "selectedCount": len(selected),
         "selectedBySource": source_use,
+        "targetDurationSec": round(shared_target, 3),
         "visionFrameBudget": VISION_JOB_FRAME_BUDGET,
     }
 
 
 def build_first_cut(duration: float) -> list[dict[str, Any]]:
-    # Deterministic R1 Director baseline. It deliberately does NOT alter the source mission/Core.
+    """Deterministic adaptive candidate pool for the AI Director."""
     duration = max(1.0, float(duration))
-    target = min(75.0, max(10.0, duration * 0.90)) if duration < 83.34 else 75.0
-    labels = [
-        ("Reveal", "REVEAL", 0.075, 8.0, 92),
-        ("Hero front", "HERO", 0.210, 10.0, 96),
-        ("Primary movement", "PRIMARY MOVEMENT", 0.370, 13.0, 91),
-        ("Detail / POI", "DETAIL / POI", 0.515, 9.0, 88),
-        ("Secondary movement", "SECONDARY MOVEMENT", 0.670, 12.0, 90),
-        ("Final hero", "FINAL HERO", 0.830, 11.0, 95),
-        ("Exit / pull-away", "EXIT", 0.945, 12.0, 89),
-    ]
-    scale = target / 75.0
+    target = target_first_cut_duration(duration)
+    candidate_count = adaptive_candidate_count(target)
+    roles = editorial_role_sequence(candidate_count)
+
+    # The complete deterministic pool still totals approximately the same target duration.
+    # AI Director may disable or locally reposition candidates; no AI prompt changes are made in R1.4.0.
+    nominal_length = target / candidate_count
+    timeline_step = duration / candidate_count
+    role_ordinals: dict[str, int] = {}
+    score_defaults = {
+        "REVEAL": 92,
+        "HERO": 96,
+        "PRIMARY MOVEMENT": 91,
+        "DETAIL / POI": 88,
+        "SECONDARY MOVEMENT": 90,
+        "FINAL HERO": 95,
+        "EXIT": 89,
+    }
+
     scenes: list[dict[str, Any]] = []
-    for i, (label, typ, center_ratio, base_len, score) in enumerate(labels, 1):
-        length = max(0.6, base_len * scale)
-        center = duration * center_ratio
-        start = max(0.0, min(duration - length, center - length / 2))
-        end = min(duration, start + length)
+    for i, typ in enumerate(roles, 1):
+        role_ordinals[typ] = role_ordinals.get(typ, 0) + 1
+        label = scene_label_for_role(typ, role_ordinals[typ])
+
+        # Uniform coverage across the full source. Keep the candidate inside its timeline cell
+        # so the deterministic fallback is chronological and non-overlapping.
+        cell_start = (i - 1) * timeline_step
+        cell_end = min(duration, i * timeline_step)
+        length = min(max(0.6, nominal_length), max(0.6, cell_end - cell_start))
+        center = (cell_start + cell_end) / 2.0
+        start = max(cell_start, center - length / 2.0)
+        end = min(cell_end, start + length)
+        if end - start < 0.6:
+            start = max(0.0, min(duration - 0.6, start))
+            end = min(duration, start + 0.6)
+
         scenes.append({
             "id": i,
             "label": label,
             "type": typ,
             "start": round(start, 3),
             "end": round(end, 3),
-            "score": score,
+            "score": score_defaults.get(typ, 90),
             "enabled": True,
             "speed": 1.0,
-            "revision": "AI",
+            "revision": "AI_ADAPTIVE_CANDIDATE_POOL",
             "corrections": [],
         })
     return scenes
@@ -862,6 +948,7 @@ async def create_job(
                 multi_results.append({
                     "sourceId": source_id,
                     "name": source_meta.get("name"),
+                    "durationSec": source_meta.get("durationSec"),
                     "scenes": local_scenes,
                     "vision": vision_analysis,
                 })

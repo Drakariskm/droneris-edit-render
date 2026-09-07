@@ -1,14 +1,17 @@
-DRONERIS R1.2.0 MULTI-SOURCE M1 — ONLY CHANGED FILES
+DRONERIS R1.4.0 ADAPTIVE FIRST CUT POOL — COMPLETE BACKEND
 
-Replace exactly these two files in GitHub repo:
-  app/main.py
-  app/vision.py
+Functional change in this revision:
+- removes the legacy fixed 7-scene deterministic First Cut candidate pool
+- standard 75 s First Cut now generates 15 chronological candidates (~5 s nominal each)
+- shorter targets scale adaptively (6-18 candidates)
+- multi-source shared-pool selection is also adaptive and no longer capped by 7 editorial roles
+- AI Director prompt, Vision logic, transitions, renderer, upload API and frontend contract are unchanged
 
-Recommended GitHub web method:
-1) Open repo -> app folder.
-2) Add file -> Upload files.
-3) Drag main.py and vision.py from this package (inside app/).
-4) Commit directly to main.
-5) Verify commit shows 2 files changed (NOT 0 files changed).
-6) Wait for Render deploy and verify root endpoint reports:
-   DRONERIS_RENDER_BACKEND_R1.2.0_MULTI_SOURCE_M1_FREE_SAFE
+Expected version from /health:
+DRONERIS_RENDER_BACKEND_R1.4.0_ADAPTIVE_FIRST_CUT_POOL_R1_FREE_SAFE
+
+Deployment:
+1. Replace the existing backend repository with this complete package.
+2. Deploy/redeploy on Render.
+3. Check /health and confirm the version above.
+4. Run one real ANALYZE/FIRST CUT test before changing Director prompt/pacing rules.
