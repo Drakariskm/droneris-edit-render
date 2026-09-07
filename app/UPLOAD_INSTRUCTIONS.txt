@@ -1,0 +1,14 @@
+DRONERIS R1.2.0 MULTI-SOURCE M1 — ONLY CHANGED FILES
+
+Replace exactly these two files in GitHub repo:
+  app/main.py
+  app/vision.py
+
+Recommended GitHub web method:
+1) Open repo -> app folder.
+2) Add file -> Upload files.
+3) Drag main.py and vision.py from this package (inside app/).
+4) Commit directly to main.
+5) Verify commit shows 2 files changed (NOT 0 files changed).
+6) Wait for Render deploy and verify root endpoint reports:
+   DRONERIS_RENDER_BACKEND_R1.2.0_MULTI_SOURCE_M1_FREE_SAFE
