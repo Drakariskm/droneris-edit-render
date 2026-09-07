@@ -19,7 +19,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.1.3_VISION_DIRECTOR_R2_FREE_SAFE"
+APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.2.0_MULTI_SOURCE_M1_FREE_SAFE"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
 
@@ -27,7 +27,10 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 ROOT = Path(os.environ.get("DRONERIS_JOB_ROOT", "/tmp/droneris_render_jobs"))
 ROOT.mkdir(parents=True, exist_ok=True)
 TTL_SECONDS = int(os.environ.get("DRONERIS_JOB_TTL_SECONDS", "21600"))  # 6 h
-MAX_UPLOAD_BYTES = int(os.environ.get("DRONERIS_MAX_UPLOAD_BYTES", str(2 * 1024**3)))  # 2 GiB app guard
+MAX_UPLOAD_BYTES = int(os.environ.get("DRONERIS_MAX_UPLOAD_BYTES", str(2 * 1024**3)))  # per-file guard
+MAX_JOB_UPLOAD_BYTES = int(os.environ.get("DRONERIS_MAX_JOB_UPLOAD_BYTES", str(2 * 1024**3)))  # total job guard
+MAX_SOURCE_COUNT = max(1, min(10, int(os.environ.get("DRONERIS_MAX_SOURCE_COUNT", "10"))))
+VISION_JOB_FRAME_BUDGET = max(16, min(64, int(os.environ.get("DRONERIS_VISION_JOB_FRAME_BUDGET", "32"))))
 
 # Render Free safety profile: keep FFmpeg memory/CPU bounded.
 RENDER_WIDTH = int(os.environ.get("DRONERIS_RENDER_WIDTH", "1280"))
@@ -177,6 +180,157 @@ def parse_kmz_summary(path: Path) -> dict[str, Any]:
     return result
 
 
+def allocate_vision_frame_counts(source_count: int) -> list[int]:
+    """Bound total Vision work for multi-source jobs while preserving 16-frame single-source R2."""
+    source_count = max(1, min(MAX_SOURCE_COUNT, int(source_count)))
+    if source_count == 1:
+        return [16]
+
+    # At least two frames/source when possible; never exceed 16/source.
+    budget = max(source_count * 2, VISION_JOB_FRAME_BUDGET)
+    budget = min(budget, source_count * 16)
+    base = max(2, min(16, budget // source_count))
+    counts = [base] * source_count
+    remaining = max(0, budget - base * source_count)
+    i = 0
+    while remaining > 0 and any(x < 16 for x in counts):
+        if counts[i] < 16:
+            counts[i] += 1
+            remaining -= 1
+        i = (i + 1) % source_count
+    return counts
+
+
+def scene_vision_quality(scene: dict[str, Any], vision: dict[str, Any] | None) -> float:
+    """Score a local source scene from Vision evidence without inventing content."""
+    base = float(scene.get("score") or 50.0)
+    if not isinstance(vision, dict) or vision.get("status") != "VISION_ANALYSIS_PASS":
+        return base
+
+    frames = [f for f in (vision.get("frames") or []) if isinstance(f, dict)]
+    if not frames:
+        return base
+
+    start = float(scene.get("start") or 0.0)
+    end = float(scene.get("end") or start)
+    mid = (start + end) / 2.0
+    inside = []
+    for f in frames:
+        try:
+            ts = float(f.get("timestampSec"))
+        except (TypeError, ValueError):
+            continue
+        if start <= ts <= end:
+            inside.append((abs(ts - mid), f))
+
+    if inside:
+        evidence = [f for _, f in sorted(inside, key=lambda x: x[0])[:3]]
+    else:
+        timed = []
+        for f in frames:
+            try:
+                ts = float(f.get("timestampSec"))
+            except (TypeError, ValueError):
+                continue
+            timed.append((abs(ts - mid), f))
+        evidence = [f for _, f in sorted(timed, key=lambda x: x[0])[:2]]
+
+    if not evidence:
+        return base
+
+    typ = str(scene.get("type") or "").upper()
+    values = []
+    for f in evidence:
+        hero = float(f.get("heroPotential") or 0.0)
+        detail = float(f.get("detailPotential") or 0.0)
+        movement = float(f.get("movementQuality") or 50.0)
+        composition = str(f.get("composition") or "UNKNOWN").upper()
+        obstruction = str(f.get("obstruction") or "UNKNOWN").upper()
+        comp_score = {"STRONG": 100.0, "GOOD": 85.0, "FAIR": 65.0, "WEAK": 35.0}.get(composition, 50.0)
+        obstruction_penalty = {"NONE": 0.0, "LOW": 5.0, "MEDIUM": 18.0, "HIGH": 40.0}.get(obstruction, 10.0)
+
+        if "HERO" in typ:
+            visual = 0.55 * hero + 0.30 * comp_score + 0.15 * movement
+        elif "DETAIL" in typ or "POI" in typ:
+            visual = 0.50 * detail + 0.30 * comp_score + 0.20 * hero
+        else:
+            visual = 0.50 * movement + 0.30 * comp_score + 0.20 * hero
+        values.append(max(0.0, visual - obstruction_penalty))
+
+    visual_avg = sum(values) / len(values)
+    source_score = float(vision.get("visionScore") or 0.0)
+    return max(0.0, min(100.0, 0.25 * base + 0.60 * visual_avg + 0.15 * source_score))
+
+
+def build_multisource_shared_cut(source_results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select one editorial grammar scene per role from a shared pool of all sources."""
+    role_order = [
+        "REVEAL",
+        "HERO",
+        "PRIMARY MOVEMENT",
+        "DETAIL / POI",
+        "SECONDARY MOVEMENT",
+        "FINAL HERO",
+        "EXIT",
+    ]
+    pool: list[dict[str, Any]] = []
+    for source in source_results:
+        source_id = str(source["sourceId"])
+        source_name = str(source.get("name") or source_id)
+        vision = source.get("vision")
+        for local_scene in source.get("scenes") or []:
+            candidate = dict(local_scene)
+            candidate["sourceId"] = source_id
+            candidate["sourceName"] = source_name
+            candidate["sourceSceneId"] = local_scene.get("id")
+            candidate["selectionQuality"] = round(scene_vision_quality(local_scene, vision), 2)
+            pool.append(candidate)
+
+    if not pool:
+        raise RuntimeError("MULTI_SOURCE_SHARED_POOL_EMPTY")
+
+    selected: list[dict[str, Any]] = []
+    source_use: dict[str, int] = {}
+    last_source = ""
+
+    for role in role_order:
+        candidates = [c for c in pool if str(c.get("type") or "").upper() == role]
+        if not candidates:
+            continue
+
+        def rank(c: dict[str, Any]) -> float:
+            sid = str(c.get("sourceId") or "")
+            diversity_bonus = 7.0 if source_use.get(sid, 0) == 0 else max(0.0, 3.0 - source_use.get(sid, 0))
+            repeat_penalty = 4.0 if sid == last_source else 0.0
+            return float(c.get("selectionQuality") or 0.0) + diversity_bonus - repeat_penalty
+
+        chosen = max(candidates, key=rank)
+        chosen = dict(chosen)
+        chosen["id"] = len(selected) + 1
+        chosen["revision"] = "MULTI_SOURCE_SHARED_POOL"
+        chosen["directorReason"] = (
+            f"Shared-pool {role} selected from {chosen.get('sourceId')} "
+            f"(quality {float(chosen.get('selectionQuality') or 0):.1f})."
+        )
+        selected.append(chosen)
+        sid = str(chosen.get("sourceId") or "")
+        source_use[sid] = source_use.get(sid, 0) + 1
+        last_source = sid
+
+    if len(selected) < 2:
+        raise RuntimeError("MULTI_SOURCE_SHARED_POOL_TOO_SPARSE")
+
+    return selected, {
+        "enabled": True,
+        "mode": "VISION_SCORED_SHARED_POOL_R1",
+        "sourceCount": len(source_results),
+        "candidateCount": len(pool),
+        "selectedCount": len(selected),
+        "selectedBySource": source_use,
+        "visionFrameBudget": VISION_JOB_FRAME_BUDGET,
+    }
+
+
 def build_first_cut(duration: float) -> list[dict[str, Any]]:
     # Deterministic R1 Director baseline. It deliberately does NOT alter the source mission/Core.
     duration = max(1.0, float(duration))
@@ -283,12 +437,35 @@ def add_music(video: Path, music: Path, output: Path) -> None:
     ], timeout=1800)
 
 
+def resolve_scene_source(job_dir: Path, state: dict[str, Any], scene: dict[str, Any]) -> Path:
+    sources = state.get("sources") or []
+    if sources:
+        source_id = str(scene.get("sourceId") or "").strip()
+        if len(sources) > 1 and not source_id:
+            raise RuntimeError("SCENE_SOURCE_ID_REQUIRED_FOR_MULTI_SOURCE")
+        if not source_id:
+            source_id = str((state.get("source") or {}).get("sourceId") or sources[0].get("sourceId") or "SRC_01")
+
+        source_meta = next((x for x in sources if str(x.get("sourceId")) == source_id), None)
+        if source_meta is None:
+            raise RuntimeError(f"SCENE_SOURCE_ID_UNKNOWN:{source_id}")
+        storage_name = Path(str(source_meta.get("storageName") or "")).name
+        source_path = job_dir / "sources" / storage_name
+        if not source_path.exists():
+            raise RuntimeError(f"SOURCE_VIDEO_MISSING:{source_id}")
+        return source_path
+
+    # Backward compatibility for jobs created by R1.1.3 and older.
+    legacy = job_dir / "source.mp4"
+    if not legacy.exists():
+        raise RuntimeError("SOURCE_VIDEO_MISSING")
+    return legacy
+
+
 def do_render(job_dir: Path, plan: dict[str, Any], music_path: Path | None) -> None:
     try:
         write_state(job_dir, renderStatus="PROCESSING", renderProgress=2, error=None)
-        source = job_dir / "source.mp4"
-        if not source.exists():
-            raise RuntimeError("SOURCE_VIDEO_MISSING")
+        state = load_state(job_dir)
         print(f"[DRONERIS] render start job={job_dir.name} profile={RENDER_WIDTH}x{RENDER_HEIGHT}@{RENDER_FPS} threads={FFMPEG_THREADS}", flush=True)
         scenes = [s for s in (plan.get("scenes") or []) if s.get("enabled", True)]
         if not scenes:
@@ -300,9 +477,11 @@ def do_render(job_dir: Path, plan: dict[str, Any], music_path: Path | None) -> N
         count = len(scenes)
         for idx, scene in enumerate(scenes, 1):
             clip = work / f"clip_{idx:03d}.mp4"
-            print(f"[DRONERIS] job={job_dir.name} scene={idx}/{count} start", flush=True)
+            source = resolve_scene_source(job_dir, state, scene)
+            source_id = str(scene.get("sourceId") or "LEGACY")
+            print(f"[DRONERIS] job={job_dir.name} scene={idx}/{count} source={source_id} start", flush=True)
             render_scene(source, scene, clip)
-            print(f"[DRONERIS] job={job_dir.name} scene={idx}/{count} done", flush=True)
+            print(f"[DRONERIS] job={job_dir.name} scene={idx}/{count} source={source_id} done", flush=True)
             clips.append(clip)
             write_state(job_dir, renderProgress=int(5 + 70 * idx / count))
         assembled = work / "assembled.mp4"
@@ -347,6 +526,12 @@ def root() -> dict[str, Any]:
             "width": RENDER_WIDTH, "height": RENDER_HEIGHT, "fps": RENDER_FPS,
             "ffmpegThreads": FFMPEG_THREADS, "preset": FFMPEG_PRESET, "crf": FFMPEG_CRF,
         },
+        "features": {
+            "multiSource": True,
+            "maxSources": MAX_SOURCE_COUNT,
+            "sceneSourceId": True,
+            "musicUpload": True,
+        },
     }
 
 
@@ -364,7 +549,8 @@ def health() -> dict[str, Any]:
 
 @app.post("/api/jobs")
 async def create_job(
-    video: UploadFile = File(...),
+    video: UploadFile | None = File(None),
+    videos: list[UploadFile] | None = File(None),
     kmz: UploadFile | None = File(None),
     srt: UploadFile | None = File(None),
     manifest: UploadFile | None = File(None),
@@ -373,14 +559,29 @@ async def create_job(
     style: str = Form("clean_real_estate"),
 ) -> JSONResponse:
     cleanup_old_jobs()
-    ext = Path(video.filename or "").suffix.lower()
-    if ext not in {".mp4", ".mov", ".m4v"}:
-        raise HTTPException(status_code=415, detail="VIDEO_FORMAT_NOT_SUPPORTED")
+
+    uploads: list[UploadFile] = []
+    if video is not None and video.filename:
+        uploads.append(video)
+    for item in videos or []:
+        if item is not None and item.filename:
+            uploads.append(item)
+
+    if not uploads:
+        raise HTTPException(status_code=422, detail="VIDEO_REQUIRED")
+    if len(uploads) > MAX_SOURCE_COUNT:
+        raise HTTPException(status_code=422, detail=f"TOO_MANY_VIDEO_SOURCES_MAX_{MAX_SOURCE_COUNT}")
+
+    for upload in uploads:
+        ext = Path(upload.filename or "").suffix.lower()
+        if ext not in {".mp4", ".mov", ".m4v"}:
+            raise HTTPException(status_code=415, detail=f"VIDEO_FORMAT_NOT_SUPPORTED:{safe_name(upload.filename, 'video')}")
 
     job_id = uuid.uuid4().hex
     job_dir = ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=False)
-    source_path = job_dir / "source.mp4"
+    sources_dir = job_dir / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
 
     write_state(
         job_dir,
@@ -391,118 +592,37 @@ async def create_job(
     )
 
     try:
-        size = await save_upload(video, source_path)
-        meta = ffprobe_json(source_path)
+        source_metas: list[dict[str, Any]] = []
+        total_upload_bytes = 0
 
-        if not meta.get("durationSec"):
-            raise HTTPException(status_code=422, detail="VIDEO_DURATION_UNAVAILABLE")
+        for index, upload in enumerate(uploads, 1):
+            source_id = f"SRC_{index:02d}"
+            original_name = safe_name(upload.filename, f"source_{index:02d}.mp4")
+            ext = Path(original_name).suffix.lower() or ".mp4"
+            storage_name = f"{source_id}{ext}"
+            source_path = sources_dir / storage_name
+
+            size = await save_upload(upload, source_path)
+            total_upload_bytes += size
+            if total_upload_bytes > MAX_JOB_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="JOB_UPLOAD_TOO_LARGE")
+
+            meta = ffprobe_json(source_path)
+            if not meta.get("durationSec"):
+                raise HTTPException(status_code=422, detail=f"VIDEO_DURATION_UNAVAILABLE:{source_id}")
+
+            source_metas.append({
+                "sourceId": source_id,
+                "name": original_name,
+                "storageName": storage_name,
+                "sourceType": source_type,
+                "primary": index == 1,
+                "sizeBytes": size,
+                **meta,
+            })
 
         extras: dict[str, Any] = {}
-        warnings = [
-            "R1_DIRECTOR_BASELINE_SERVER_SIDE",
-            "AI_VISION_NOT_CONNECTED_YET",
-        ]
-
-        # AI VISION DIRECTOR R2 — Phase 1 only.
-        # Extract exactly 16 evenly distributed frames.
-        # Fail-open contract: an R2 sampler problem must never stop R1.
-        try:
-            vision_frames_dir = job_dir / "vision_frames"
-            vision_manifest = await asyncio.to_thread(
-                build_vision_sample_manifest,
-                source_path,
-                vision_frames_dir,
-                frame_count=16,
-            )
-
-            sampled_frames = vision_manifest.get("frames") or []
-            safe_frames: list[dict[str, Any]] = []
-
-            for frame in sampled_frames:
-                frame_path = Path(str(frame.get("path") or ""))
-                safe_frames.append({
-                    "index": frame.get("index"),
-                    "timestampSec": frame.get("timestamp_s"),
-                    "file": frame_path.name,
-                    "sizeBytes": frame_path.stat().st_size if frame_path.is_file() else 0,
-                })
-
-            sampler_ok = (
-                vision_manifest.get("status") == "FRAME_SAMPLER_PASS"
-                and len(safe_frames) == 16
-                and all(int(f.get("sizeBytes") or 0) > 0 for f in safe_frames)
-            )
-
-            extras["aiVisionSampler"] = {
-                "enabled": True,
-                "status": "FRAME_SAMPLER_PASS" if sampler_ok else "FRAME_SAMPLER_INCOMPLETE",
-                "version": vision_manifest.get("version"),
-                "frameCount": len(safe_frames),
-                "visionConnected": False,
-                "frames": safe_frames,
-            }
-
-            if sampler_ok:
-                warnings.append("VISION_FRAME_SAMPLER_PASS")
-
-                # AI VISION DIRECTOR R2 — Phase 2.
-                # Analyze the 16 sampled images with OpenAI Vision.
-                # Fail-open contract: Vision analysis must never stop R1.
-                try:
-                    vision_analysis = await asyncio.to_thread(
-                        analyze_sampled_frames_with_openai,
-                        openai_client=openai_client,
-                        model=OPENAI_MODEL,
-                        sample_manifest=vision_manifest,
-                        source_type=source_type,
-                        style=style,
-                    )
-
-                    extras["aiVision"] = vision_analysis
-
-                    if vision_analysis.get("status") == "VISION_ANALYSIS_PASS":
-                        warnings = [
-                            w for w in warnings
-                            if w != "AI_VISION_NOT_CONNECTED_YET"
-                        ]
-                        warnings.append("VISION_ANALYSIS_PASS")
-                    else:
-                        warnings.append(
-                            str(vision_analysis.get("status") or "VISION_ANALYSIS_WARNING")
-                        )
-
-                except Exception as vision_error:
-                    print(
-                        f"[DRONERIS] vision analysis warning job={job_id} "
-                        f"error={type(vision_error).__name__}:{vision_error}",
-                        flush=True,
-                    )
-                    extras["aiVision"] = {
-                        "enabled": False,
-                        "status": "VISION_ANALYSIS_WARNING",
-                        "visionConnected": False,
-                        "warning": f"{type(vision_error).__name__}:{vision_error}",
-                    }
-                    warnings.append("VISION_ANALYSIS_WARNING")
-
-            else:
-                warnings.append("VISION_FRAME_SAMPLER_INCOMPLETE")
-
-        except Exception as e:
-            print(
-                f"[DRONERIS] vision sampler warning job={job_id} "
-                f"error={type(e).__name__}:{e}",
-                flush=True,
-            )
-
-            extras["aiVisionSampler"] = {
-                "enabled": False,
-                "status": "FRAME_SAMPLER_WARNING",
-                "frameCount": 0,
-                "visionConnected": False,
-                "warning": f"{type(e).__name__}:{e}",
-            }
-            warnings.append("VISION_FRAME_SAMPLER_WARNING")
+        warnings = ["R1_DIRECTOR_BASELINE_SERVER_SIDE"]
 
         if kmz is not None and kmz.filename:
             kp = job_dir / safe_name(kmz.filename, "mission.kmz")
@@ -519,29 +639,168 @@ async def create_job(
             await save_upload(manifest, mp)
             extras["manifest"] = {"name": mp.name, "readOnly": True}
 
-        scenes = build_first_cut(float(meta["durationSec"]))
+        # Preserve the exact single-source R1.1.3 Vision + Director contract.
+        if len(source_metas) == 1:
+            meta = source_metas[0]
+            source_path = sources_dir / str(meta["storageName"])
+            warnings.append("AI_VISION_NOT_CONNECTED_YET")
 
-        scenes, ai_director = improve_first_cut_with_ai(
-            openai_client=openai_client,
-            model=OPENAI_MODEL,
-            duration=float(meta["durationSec"]),
-            scenes=scenes,
-            source_type=source_type,
-            style=style,
-            vision_analysis=extras.get("aiVision"),
-        )
+            try:
+                vision_frames_dir = job_dir / "vision_frames"
+                vision_manifest = await asyncio.to_thread(
+                    build_vision_sample_manifest,
+                    source_path,
+                    vision_frames_dir,
+                    frame_count=16,
+                )
 
-        extras["aiDirector"] = ai_director
+                sampled_frames = vision_manifest.get("frames") or []
+                safe_frames: list[dict[str, Any]] = []
+                for frame in sampled_frames:
+                    frame_path = Path(str(frame.get("path") or ""))
+                    safe_frames.append({
+                        "index": frame.get("index"),
+                        "timestampSec": frame.get("timestamp_s"),
+                        "file": frame_path.name,
+                        "sizeBytes": frame_path.stat().st_size if frame_path.is_file() else 0,
+                    })
 
+                sampler_ok = (
+                    vision_manifest.get("status") == "FRAME_SAMPLER_PASS"
+                    and len(safe_frames) == 16
+                    and all(int(f.get("sizeBytes") or 0) > 0 for f in safe_frames)
+                )
+                extras["aiVisionSampler"] = {
+                    "enabled": True,
+                    "status": "FRAME_SAMPLER_PASS" if sampler_ok else "FRAME_SAMPLER_INCOMPLETE",
+                    "version": vision_manifest.get("version"),
+                    "frameCount": len(safe_frames),
+                    "visionConnected": False,
+                    "frames": safe_frames,
+                }
+
+                if sampler_ok:
+                    warnings.append("VISION_FRAME_SAMPLER_PASS")
+                    try:
+                        vision_analysis = await asyncio.to_thread(
+                            analyze_sampled_frames_with_openai,
+                            openai_client=openai_client,
+                            model=OPENAI_MODEL,
+                            sample_manifest=vision_manifest,
+                            source_type=source_type,
+                            style=style,
+                        )
+                        extras["aiVision"] = vision_analysis
+                        if vision_analysis.get("status") == "VISION_ANALYSIS_PASS":
+                            warnings = [w for w in warnings if w != "AI_VISION_NOT_CONNECTED_YET"]
+                            warnings.append("VISION_ANALYSIS_PASS")
+                        else:
+                            warnings.append(str(vision_analysis.get("status") or "VISION_ANALYSIS_WARNING"))
+                    except Exception as vision_error:
+                        extras["aiVision"] = {
+                            "enabled": False,
+                            "status": "VISION_ANALYSIS_WARNING",
+                            "visionConnected": False,
+                            "warning": f"{type(vision_error).__name__}:{vision_error}",
+                        }
+                        warnings.append("VISION_ANALYSIS_WARNING")
+                else:
+                    warnings.append("VISION_FRAME_SAMPLER_INCOMPLETE")
+            except Exception as e:
+                extras["aiVisionSampler"] = {
+                    "enabled": False,
+                    "status": "FRAME_SAMPLER_WARNING",
+                    "frameCount": 0,
+                    "visionConnected": False,
+                    "warning": f"{type(e).__name__}:{e}",
+                }
+                warnings.append("VISION_FRAME_SAMPLER_WARNING")
+
+            scenes = build_first_cut(float(meta["durationSec"]))
+            scenes, ai_director = improve_first_cut_with_ai(
+                openai_client=openai_client,
+                model=OPENAI_MODEL,
+                duration=float(meta["durationSec"]),
+                scenes=scenes,
+                source_type=source_type,
+                style=style,
+                vision_analysis=extras.get("aiVision"),
+            )
+            for scene in scenes:
+                scene["sourceId"] = str(meta["sourceId"])
+            extras["aiDirector"] = ai_director
+
+        else:
+            # Multi-source M1: bounded per-source Vision evidence -> one shared shot pool.
+            frame_counts = allocate_vision_frame_counts(len(source_metas))
+            multi_results: list[dict[str, Any]] = []
+            source_vision_extras: list[dict[str, Any]] = []
+
+            for source_meta, frame_count in zip(source_metas, frame_counts):
+                source_id = str(source_meta["sourceId"])
+                source_path = sources_dir / str(source_meta["storageName"])
+                vision_manifest: dict[str, Any] | None = None
+                vision_analysis: dict[str, Any] | None = None
+                source_warning: str | None = None
+
+                try:
+                    vision_frames_dir = job_dir / "vision_frames" / source_id
+                    vision_manifest = await asyncio.to_thread(
+                        build_vision_sample_manifest,
+                        source_path,
+                        vision_frames_dir,
+                        frame_count=frame_count,
+                    )
+                    try:
+                        vision_analysis = await asyncio.to_thread(
+                            analyze_sampled_frames_with_openai,
+                            openai_client=openai_client,
+                            model=OPENAI_MODEL,
+                            sample_manifest=vision_manifest,
+                            source_type=source_type,
+                            style=style,
+                        )
+                    except Exception as vision_error:
+                        source_warning = f"VISION_ANALYSIS_WARNING:{type(vision_error).__name__}:{vision_error}"
+                except Exception as sampler_error:
+                    source_warning = f"FRAME_SAMPLER_WARNING:{type(sampler_error).__name__}:{sampler_error}"
+
+                local_scenes = build_first_cut(float(source_meta["durationSec"]))
+                for scene in local_scenes:
+                    scene["sourceId"] = source_id
+
+                multi_results.append({
+                    "sourceId": source_id,
+                    "name": source_meta.get("name"),
+                    "scenes": local_scenes,
+                    "vision": vision_analysis,
+                })
+                source_vision_extras.append({
+                    "sourceId": source_id,
+                    "frameCount": frame_count,
+                    "samplerStatus": (vision_manifest or {}).get("status") if vision_manifest else "WARNING",
+                    "visionStatus": (vision_analysis or {}).get("status") if vision_analysis else "VISION_NOT_AVAILABLE",
+                    "visionScore": (vision_analysis or {}).get("visionScore") if vision_analysis else None,
+                    "warning": source_warning,
+                })
+
+            scenes, multi_director = build_multisource_shared_cut(multi_results)
+            extras["multiSource"] = multi_director
+            extras["multiSourceVision"] = source_vision_extras
+            warnings.append("MULTI_SOURCE_SHARED_POOL_PASS")
+            if any(x.get("visionStatus") == "VISION_ANALYSIS_PASS" for x in source_vision_extras):
+                warnings.append("MULTI_SOURCE_VISION_PARTIAL_OR_FULL_PASS")
+            else:
+                warnings.append("MULTI_SOURCE_VISION_FALLBACK")
+
+        primary_source = dict(source_metas[0])
         state = write_state(
             job_dir,
             status="READY",
-            source={
-                "name": safe_name(video.filename, "source.mp4"),
-                "sourceType": source_type,
-                "sizeBytes": size,
-                **meta,
-            },
+            source=primary_source,
+            sources=source_metas,
+            sourceCount=len(source_metas),
+            totalUploadBytes=total_upload_bytes,
             missionId=mission_id,
             style=style,
             extras=extras,
@@ -554,6 +813,8 @@ async def create_job(
             "jobId": job_id,
             "status": state["status"],
             "source": state["source"],
+            "sources": source_metas,
+            "sourceCount": len(source_metas),
             "missionId": mission_id,
             "extras": extras,
             "scenes": scenes,
@@ -563,14 +824,12 @@ async def create_job(
     except HTTPException:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
-
     except subprocess.CalledProcessError as e:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(
             status_code=422,
             detail=f"MEDIA_PROBE_FAILED:{e.stderr[-300:] if e.stderr else ''}",
         )
-
     except Exception as e:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(

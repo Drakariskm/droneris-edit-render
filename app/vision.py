@@ -549,9 +549,10 @@ def analyze_sampled_frames_with_openai(
         }
 
     raw_frames = sample_manifest.get("frames") or []
-    if len(raw_frames) != DEFAULT_FRAME_COUNT:
+    frame_count = len(raw_frames)
+    if frame_count < 1 or frame_count > DEFAULT_FRAME_COUNT:
         raise VisionAnalysisError(
-            f"Expected {DEFAULT_FRAME_COUNT} sampled frames, got {len(raw_frames)}."
+            f"Expected between 1 and {DEFAULT_FRAME_COUNT} sampled frames, got {frame_count}."
         )
 
     prepared_frames: List[Dict[str, Any]] = []
@@ -560,18 +561,18 @@ def analyze_sampled_frames_with_openai(
     prompt = f"""
 You are DRONERIS AI VISION DIRECTOR R2.
 
-Analyze 16 uniformly sampled frames from one drone real-estate video.
+Analyze {frame_count} uniformly sampled frames from one drone real-estate video.
 
 SOURCE TYPE: {source_type}
 EDIT STYLE: {style}
 
-The images are ordered chronologically from frame 1 to frame 16.
+The images are ordered chronologically from frame 1 to frame {frame_count}.
 
 Your task is visual analysis only. Do not invent motion that cannot be inferred from adjacent sampled frames.
 Evaluate what is visibly present in each frame and how useful it is for film editing.
 
 For every frame return:
-- index: 1..16
+- index: 1..{frame_count}
 - subjectVisible: true/false
 - subjectOccupancy: approximate fraction of frame height occupied by the principal property/subject, 0.0..1.0
 - composition: STRONG | GOOD | FAIR | WEAK | UNKNOWN
