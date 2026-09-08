@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-DIRECTOR_VERSION = "DRONERIS_AI_EDIT_DIRECTOR_R2_VISION_AWARE_2026_09_01"
+DIRECTOR_VERSION = "DRONERIS_AI_EDIT_DIRECTOR_R3_TRANSITION_AWARE_2026_09_08"
 R1_FALLBACK_VERSION = "DRONERIS_AI_EDIT_DIRECTOR_R1_2026_09_01"
 
 DRONERIS_DIRECTOR_PROMPT = """
@@ -60,6 +60,33 @@ EXIT: 1.00-1.03
 
 Never exceed 1.15.
 
+TRANSITION DIRECTION
+Choose the transition AFTER each enabled scene. The final enabled scene must use CUT.
+CUT is the professional default. Use a visible transition only when it improves continuity, pacing, or a deliberate change of section.
+Do NOT put a visible transition on every join. For a normal 12-18 clip film, usually 2-4 visible transitions are enough.
+
+Allowed transitionOut values:
+- CUT — default for most joins, especially continuous motion and energetic pacing.
+- CROSSFADE — restrained soft continuity between compatible calm/HERO shots.
+- DISSOLVE — deliberate visual/time/section change; use sparingly.
+- DIP_BLACK — major chapter/location break only; normally zero or one per film.
+
+Transition duration guidance:
+- CUT: 0.0 seconds
+- CROSSFADE: 0.35-0.80 seconds
+- DISSOLVE: 0.40-0.90 seconds
+- DIP_BLACK: 0.40-0.80 seconds
+
+Transition selection rules:
+- Prefer CUT when unsure.
+- Do not use a visible transition to hide a weak edit; choose better scene timing instead.
+- Avoid repeated decorative transitions.
+- Similar direction/motion with good continuity usually wants CUT.
+- Calm HERO to calm HERO may justify CROSSFADE.
+- Strong semantic/temporal section change may justify DISSOLVE.
+- DIP_BLACK must be rare and intentional.
+- Style should influence restraint, not override visual evidence.
+
 Return JSON only in this exact shape:
 
 {
@@ -72,6 +99,9 @@ Return JSON only in this exact shape:
       "end": 6.0,
       "zoomFactor": 1.0,
       "speed": 1.0,
+      "transitionOut": "CUT",
+      "transitionDuration": 0.0,
+      "transitionReason": "short factual explanation",
       "reason": "short factual explanation"
     }
   ]
@@ -132,6 +162,65 @@ def _sample_interval(vision_analysis: dict[str, Any], duration: float) -> float:
         return max(1.0, min(12.0, sum(gaps) / len(gaps)))
     return max(1.0, min(12.0, float(duration) / 16.0))
 
+
+def _normalize_transition(name: Any) -> str:
+    key = str(name or "CUT").strip().upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "FADE": "CROSSFADE",
+        "CROSS_FADE": "CROSSFADE",
+        "DIPBLACK": "DIP_BLACK",
+        "FADE_BLACK": "DIP_BLACK",
+    }
+    key = aliases.get(key, key)
+    return key if key in {"CUT", "CROSSFADE", "DISSOLVE", "DIP_BLACK"} else "CUT"
+
+
+def _transition_duration(kind: str, value: Any) -> float:
+    if kind == "CUT":
+        return 0.0
+    ranges = {
+        "CROSSFADE": (0.35, 0.80, 0.55),
+        "DISSOLVE": (0.40, 0.90, 0.60),
+        "DIP_BLACK": (0.40, 0.80, 0.55),
+    }
+    lo, hi, default = ranges[kind]
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = default
+    return round(max(lo, min(hi, v)), 3)
+
+
+def _apply_transition_guard(scenes: list[dict[str, Any]]) -> None:
+    enabled_indexes = [i for i, s in enumerate(scenes) if s.get("enabled", True)]
+    if not enabled_indexes:
+        return
+
+    # Final enabled scene never transitions to another clip.
+    last_enabled = enabled_indexes[-1]
+    scenes[last_enabled]["transitionOut"] = "CUT"
+    scenes[last_enabled]["transitionDuration"] = 0.0
+
+    joins = max(0, len(enabled_indexes) - 1)
+    max_visible = min(4, max(1, round(joins * 0.30))) if joins else 0
+    visible_seen = 0
+    dip_black_seen = 0
+
+    for idx in enabled_indexes[:-1]:
+        scene = scenes[idx]
+        kind = _normalize_transition(scene.get("transitionOut"))
+        if kind == "DIP_BLACK":
+            if dip_black_seen >= 1:
+                kind = "CUT"
+            else:
+                dip_black_seen += 1
+        if kind != "CUT":
+            if visible_seen >= max_visible:
+                kind = "CUT"
+            else:
+                visible_seen += 1
+        scene["transitionOut"] = kind
+        scene["transitionDuration"] = _transition_duration(kind, scene.get("transitionDuration"))
 
 def improve_first_cut_with_ai(
     *,
@@ -195,6 +284,10 @@ def improve_first_cut_with_ai(
             "maxSpeed": 1.35,
             "minimumEnabledScenes": 2,
             "localShiftLimitSec": round(local_shift, 3),
+            "allowedTransitions": ["CUT", "CROSSFADE", "DISSOLVE", "DIP_BLACK"],
+            "cutIsDefault": True,
+            "maxVisibleTransitionRatio": 0.30,
+            "maxDipBlack": 1,
         },
     }
 
@@ -252,12 +345,18 @@ def improve_first_cut_with_ai(
             updated["enabled"] = bool(ai_scene.get("enabled", True))
             updated["zoomFactor"] = round(zoom, 3)
             updated["speed"] = round(speed, 3)
+            transition_kind = _normalize_transition(ai_scene.get("transitionOut", "CUT"))
+            updated["transitionOut"] = transition_kind
+            updated["transitionDuration"] = _transition_duration(transition_kind, ai_scene.get("transitionDuration", 0.0))
+            updated["transitionReason"] = str(ai_scene.get("transitionReason", ""))[:240]
             updated["directorReason"] = str(ai_scene.get("reason", ""))[:240]
             updated["revision"] = "AI_VISION_DIRECTOR" if vision_enabled else "AI_DIRECTOR"
 
             final_scenes.append(updated)
             used_ids.add(scene_id)
             last_end = end
+
+        _apply_transition_guard(final_scenes)
 
         enabled_count = sum(1 for scene in final_scenes if scene.get("enabled", True))
         if enabled_count < 2:

@@ -19,7 +19,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.4.0_ADAPTIVE_FIRST_CUT_POOL_R1_FREE_SAFE"
+APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.5.0_AI_TRANSITION_SUGGESTIONS_R1_FREE_SAFE"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
 
