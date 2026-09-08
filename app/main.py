@@ -19,7 +19,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.5.0_AI_TRANSITION_SUGGESTIONS_R1_FREE_SAFE"
+APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.6.0_AI_EDIT_STRENGTH_R1_FREE_SAFE"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
 
@@ -262,17 +262,72 @@ def scene_vision_quality(scene: dict[str, Any], vision: dict[str, Any] | None) -
     return max(0.0, min(100.0, 0.25 * base + 0.60 * visual_avg + 0.15 * source_score))
 
 
+EDIT_STRENGTH_PROFILES: dict[str, dict[str, Any]] = {
+    "low": {
+        "label": "LOW",
+        "avgShotSec": 6.25,
+        "minCandidates": 6,
+        "maxCandidates": 14,
+        "minSpeed": 0.95,
+        "maxSpeed": 1.10,
+        "maxZoomFactor": 1.08,
+        "maxVisibleTransitionRatio": 0.15,
+        "maxVisibleTransitions": 2,
+        "maxDipBlack": 0,
+    },
+    "medium": {
+        "label": "MEDIUM",
+        "avgShotSec": 5.00,
+        "minCandidates": 6,
+        "maxCandidates": 18,
+        "minSpeed": 0.85,
+        "maxSpeed": 1.25,
+        "maxZoomFactor": 1.12,
+        "maxVisibleTransitionRatio": 0.30,
+        "maxVisibleTransitions": 4,
+        "maxDipBlack": 1,
+    },
+    "high": {
+        "label": "HIGH",
+        "avgShotSec": 4.17,
+        "minCandidates": 8,
+        "maxCandidates": 22,
+        "minSpeed": 0.75,
+        "maxSpeed": 1.35,
+        "maxZoomFactor": 1.15,
+        "maxVisibleTransitionRatio": 0.35,
+        "maxVisibleTransitions": 5,
+        "maxDipBlack": 1,
+    },
+}
+
+
+def normalize_edit_strength(value: Any) -> str:
+    key = str(value or "medium").strip().lower()
+    aliases = {
+        "blago": "low", "slabo": "low", "light": "low",
+        "srednje": "medium", "normal": "medium", "balanced": "medium",
+        "jako": "high", "strong": "high", "dynamic": "high",
+    }
+    key = aliases.get(key, key)
+    return key if key in EDIT_STRENGTH_PROFILES else "medium"
+
+
+def edit_strength_profile(value: Any) -> dict[str, Any]:
+    return dict(EDIT_STRENGTH_PROFILES[normalize_edit_strength(value)])
+
+
 def target_first_cut_duration(source_duration: float) -> float:
     """Return the deterministic First Cut duration target without changing the 75 s product target."""
     duration = max(1.0, float(source_duration))
     return min(75.0, max(10.0, duration * 0.90)) if duration < 83.34 else 75.0
 
 
-def adaptive_candidate_count(target_duration: float) -> int:
-    """Build a wider editorial candidate pool instead of the legacy fixed seven slots."""
-    # ~5 s per candidate gives 15 candidates for the standard 75 s First Cut.
-    # Keep bounds conservative for short sources and for Render Free payload size.
-    return max(6, min(18, int(round(max(10.0, float(target_duration)) / 5.0))))
+def adaptive_candidate_count(target_duration: float, edit_strength: str = "medium") -> int:
+    """Strength-aware candidate count while preserving the 75 s product target."""
+    profile = edit_strength_profile(edit_strength)
+    count = int(round(max(10.0, float(target_duration)) / float(profile["avgShotSec"])))
+    return max(int(profile["minCandidates"]), min(int(profile["maxCandidates"]), count))
 
 
 def editorial_role_sequence(count: int) -> list[str]:
@@ -310,7 +365,7 @@ def scene_label_for_role(role: str, ordinal: int) -> str:
     return base if ordinal == 1 else f"{base} {ordinal}"
 
 
-def build_multisource_shared_cut(source_results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def build_multisource_shared_cut(source_results: list[dict[str, Any]], edit_strength: str = "medium") -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Select an adaptive editorial sequence from the shared pool of all sources."""
     pool: list[dict[str, Any]] = []
     total_available = 0.0
@@ -334,7 +389,7 @@ def build_multisource_shared_cut(source_results: list[dict[str, Any]]) -> tuple[
         raise RuntimeError("MULTI_SOURCE_SHARED_POOL_EMPTY")
 
     shared_target = target_first_cut_duration(total_available if total_available > 0 else 75.0)
-    target_count = adaptive_candidate_count(shared_target)
+    target_count = adaptive_candidate_count(shared_target, edit_strength)
     role_order = editorial_role_sequence(target_count)
 
     selected: list[dict[str, Any]] = []
@@ -395,14 +450,15 @@ def build_multisource_shared_cut(source_results: list[dict[str, Any]]) -> tuple[
         "selectedBySource": source_use,
         "targetDurationSec": round(shared_target, 3),
         "visionFrameBudget": VISION_JOB_FRAME_BUDGET,
+        "editStrength": normalize_edit_strength(edit_strength),
     }
 
 
-def build_first_cut(duration: float) -> list[dict[str, Any]]:
+def build_first_cut(duration: float, edit_strength: str = "medium") -> list[dict[str, Any]]:
     """Deterministic adaptive candidate pool for the AI Director."""
     duration = max(1.0, float(duration))
     target = target_first_cut_duration(duration)
-    candidate_count = adaptive_candidate_count(target)
+    candidate_count = adaptive_candidate_count(target, edit_strength)
     roles = editorial_role_sequence(candidate_count)
 
     # The complete deterministic pool still totals approximately the same target duration.
@@ -446,7 +502,7 @@ def build_first_cut(duration: float) -> list[dict[str, Any]]:
             "score": score_defaults.get(typ, 90),
             "enabled": True,
             "speed": 1.0,
-            "revision": "AI_ADAPTIVE_CANDIDATE_POOL",
+            "revision": f"AI_ADAPTIVE_CANDIDATE_POOL_{normalize_edit_strength(edit_strength).upper()}",
             "corrections": [],
         })
     return scenes
@@ -707,6 +763,8 @@ def root() -> dict[str, Any]:
             "transitionEngine": True,
             "transitions": ["CUT", "CROSSFADE", "DISSOLVE", "DIP_BLACK"],
             "fadeInOut": True,
+            "aiEditStrength": True,
+            "editStrengthValues": ["low", "medium", "high"],
         },
     }
 
@@ -733,8 +791,11 @@ async def create_job(
     source_type: str = Form("REAL_FLIGHT"),
     mission_id: str = Form(""),
     style: str = Form("clean_real_estate"),
+    edit_strength: str = Form("medium"),
 ) -> JSONResponse:
     cleanup_old_jobs()
+    edit_strength = normalize_edit_strength(edit_strength)
+    strength_profile = edit_strength_profile(edit_strength)
 
     uploads: list[UploadFile] = []
     if video is not None and video.filename:
@@ -892,7 +953,7 @@ async def create_job(
                 }
                 warnings.append("VISION_FRAME_SAMPLER_WARNING")
 
-            scenes = build_first_cut(float(meta["durationSec"]))
+            scenes = build_first_cut(float(meta["durationSec"]), edit_strength)
             scenes, ai_director = improve_first_cut_with_ai(
                 openai_client=openai_client,
                 model=OPENAI_MODEL,
@@ -901,6 +962,7 @@ async def create_job(
                 source_type=source_type,
                 style=style,
                 vision_analysis=extras.get("aiVision"),
+                edit_strength=edit_strength,
             )
             for scene in scenes:
                 scene["sourceId"] = str(meta["sourceId"])
@@ -941,7 +1003,7 @@ async def create_job(
                 except Exception as sampler_error:
                     source_warning = f"FRAME_SAMPLER_WARNING:{type(sampler_error).__name__}:{sampler_error}"
 
-                local_scenes = build_first_cut(float(source_meta["durationSec"]))
+                local_scenes = build_first_cut(float(source_meta["durationSec"]), edit_strength)
                 for scene in local_scenes:
                     scene["sourceId"] = source_id
 
@@ -961,7 +1023,7 @@ async def create_job(
                     "warning": source_warning,
                 })
 
-            scenes, multi_director = build_multisource_shared_cut(multi_results)
+            scenes, multi_director = build_multisource_shared_cut(multi_results, edit_strength)
             extras["multiSource"] = multi_director
             extras["multiSourceVision"] = source_vision_extras
             warnings.append("MULTI_SOURCE_SHARED_POOL_PASS")
@@ -969,6 +1031,15 @@ async def create_job(
                 warnings.append("MULTI_SOURCE_VISION_PARTIAL_OR_FULL_PASS")
             else:
                 warnings.append("MULTI_SOURCE_VISION_FALLBACK")
+
+        extras["editStrength"] = {
+            "value": edit_strength,
+            "label": strength_profile["label"],
+            "candidateCount": adaptive_candidate_count(target_first_cut_duration(sum(float(x.get("durationSec") or 0.0) for x in source_metas)), edit_strength),
+            "maxZoomFactor": strength_profile["maxZoomFactor"],
+            "speedRange": [strength_profile["minSpeed"], strength_profile["maxSpeed"]],
+            "maxVisibleTransitions": strength_profile["maxVisibleTransitions"],
+        }
 
         primary_source = dict(source_metas[0])
         state = write_state(
@@ -980,6 +1051,7 @@ async def create_job(
             totalUploadBytes=total_upload_bytes,
             missionId=mission_id,
             style=style,
+            editStrength=edit_strength,
             extras=extras,
             scenes=scenes,
             coreIsolation="READ_ONLY_NO_MISSION_WRITEBACK",
@@ -993,6 +1065,7 @@ async def create_job(
             "sources": source_metas,
             "sourceCount": len(source_metas),
             "missionId": mission_id,
+            "editStrength": edit_strength,
             "extras": extras,
             "scenes": scenes,
             "warnings": warnings,

@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-DIRECTOR_VERSION = "DRONERIS_AI_EDIT_DIRECTOR_R3_TRANSITION_AWARE_2026_09_08"
+DIRECTOR_VERSION = "DRONERIS_AI_EDIT_DIRECTOR_R4_STRENGTH_AWARE_2026_09_08"
 R1_FALLBACK_VERSION = "DRONERIS_AI_EDIT_DIRECTOR_R1_2026_09_01"
 
 DRONERIS_DIRECTOR_PROMPT = """
-You are DRONERIS AI EDIT DIRECTOR R2.
+You are DRONERIS AI EDIT DIRECTOR R4.
 
 You refine a deterministic First Cut for professional cinematic drone footage
 used for real-estate and property presentation.
@@ -86,6 +86,29 @@ Transition selection rules:
 - Strong semantic/temporal section change may justify DISSOLVE.
 - DIP_BLACK must be rare and intentional.
 - Style should influence restraint, not override visual evidence.
+
+AI EDIT STRENGTH
+The user selects exactly one editStrength: LOW, MEDIUM, or HIGH.
+This controls editorial intervention, not source quality or mission safety.
+
+LOW / restrained:
+- Prefer longer, calmer shots and preserve natural camera movement.
+- Make fewer timing, speed, and zoom interventions.
+- Keep visible transitions rare; CUT should dominate.
+- Do not create artificial energy.
+
+MEDIUM / balanced:
+- Balanced cinematic pacing with clear visual variety.
+- Moderate timing refinements and restrained speed/zoom corrections.
+- Use visible transitions selectively.
+
+HIGH / dynamic:
+- Prefer shorter, more varied shots while preserving continuity and strong HERO moments.
+- Be more willing to refine timing and use speed/zoom within the supplied hard limits.
+- Pacing may be more energetic, but never use effects mechanically.
+- CUT remains the default even at HIGH strength.
+
+The user payload contains the exact hard limits for the selected strength. Those limits override generic guidance above.
 
 Return JSON only in this exact shape:
 
@@ -191,7 +214,48 @@ def _transition_duration(kind: str, value: Any) -> float:
     return round(max(lo, min(hi, v)), 3)
 
 
-def _apply_transition_guard(scenes: list[dict[str, Any]]) -> None:
+EDIT_STRENGTH_POLICY: dict[str, dict[str, Any]] = {
+    "low": {
+        "label": "LOW",
+        "minSpeed": 0.95, "maxSpeed": 1.10, "maxZoomFactor": 1.08,
+        "visibleRatio": 0.15, "maxVisible": 2, "maxDipBlack": 0,
+    },
+    "medium": {
+        "label": "MEDIUM",
+        "minSpeed": 0.85, "maxSpeed": 1.25, "maxZoomFactor": 1.12,
+        "visibleRatio": 0.30, "maxVisible": 4, "maxDipBlack": 1,
+    },
+    "high": {
+        "label": "HIGH",
+        "minSpeed": 0.75, "maxSpeed": 1.35, "maxZoomFactor": 1.15,
+        "visibleRatio": 0.35, "maxVisible": 5, "maxDipBlack": 1,
+    },
+}
+
+
+def _normalize_edit_strength(value: Any) -> str:
+    key = str(value or "medium").strip().lower()
+    aliases = {
+        "blago": "low", "slabo": "low", "light": "low",
+        "srednje": "medium", "normal": "medium", "balanced": "medium",
+        "jako": "high", "strong": "high", "dynamic": "high",
+    }
+    key = aliases.get(key, key)
+    return key if key in EDIT_STRENGTH_POLICY else "medium"
+
+
+def _strength_policy(value: Any) -> dict[str, Any]:
+    return dict(EDIT_STRENGTH_POLICY[_normalize_edit_strength(value)])
+
+
+def _minimum_enabled(candidate_count: int, edit_strength: str) -> int:
+    count = max(2, int(candidate_count))
+    strength = _normalize_edit_strength(edit_strength)
+    keep_margin = {"low": 2, "medium": 2, "high": 1}[strength]
+    return max(2, count - keep_margin)
+
+
+def _apply_transition_guard(scenes: list[dict[str, Any]], edit_strength: str = "medium") -> None:
     enabled_indexes = [i for i, s in enumerate(scenes) if s.get("enabled", True)]
     if not enabled_indexes:
         return
@@ -201,16 +265,19 @@ def _apply_transition_guard(scenes: list[dict[str, Any]]) -> None:
     scenes[last_enabled]["transitionOut"] = "CUT"
     scenes[last_enabled]["transitionDuration"] = 0.0
 
+    policy = _strength_policy(edit_strength)
     joins = max(0, len(enabled_indexes) - 1)
-    max_visible = min(4, max(1, round(joins * 0.30))) if joins else 0
+    ratio_budget = max(1, round(joins * float(policy["visibleRatio"]))) if joins else 0
+    max_visible = min(int(policy["maxVisible"]), ratio_budget) if joins else 0
     visible_seen = 0
     dip_black_seen = 0
+    max_dip_black = int(policy["maxDipBlack"])
 
     for idx in enabled_indexes[:-1]:
         scene = scenes[idx]
         kind = _normalize_transition(scene.get("transitionOut"))
         if kind == "DIP_BLACK":
-            if dip_black_seen >= 1:
+            if dip_black_seen >= max_dip_black:
                 kind = "CUT"
             else:
                 dip_black_seen += 1
@@ -231,6 +298,7 @@ def improve_first_cut_with_ai(
     source_type: str = "REAL_FLIGHT",
     style: str = "clean_real_estate",
     vision_analysis: dict[str, Any] | None = None,
+    edit_strength: str = "medium",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
     if openai_client is None:
@@ -242,6 +310,9 @@ def improve_first_cut_with_ai(
         }
 
     vision_enabled = _valid_vision(vision_analysis)
+    edit_strength = _normalize_edit_strength(edit_strength)
+    strength_policy = _strength_policy(edit_strength)
+    minimum_enabled = _minimum_enabled(len(scenes), edit_strength)
     local_shift = _sample_interval(vision_analysis, duration) if vision_enabled else 0.0
 
     candidates = []
@@ -275,19 +346,21 @@ def improve_first_cut_with_ai(
         "sourceDurationSec": round(float(duration), 3),
         "sourceType": str(source_type or "REAL_FLIGHT"),
         "style": str(style or "clean_real_estate"),
+        "editStrength": strength_policy["label"],
         "candidateScenes": candidates,
         "constraints": {
             "visionAware": vision_enabled,
             "preserveChronology": True,
-            "maxZoomFactor": 1.15,
-            "minSpeed": 0.75,
-            "maxSpeed": 1.35,
-            "minimumEnabledScenes": 2,
+            "maxZoomFactor": strength_policy["maxZoomFactor"],
+            "minSpeed": strength_policy["minSpeed"],
+            "maxSpeed": strength_policy["maxSpeed"],
+            "minimumEnabledScenes": minimum_enabled,
             "localShiftLimitSec": round(local_shift, 3),
             "allowedTransitions": ["CUT", "CROSSFADE", "DISSOLVE", "DIP_BLACK"],
             "cutIsDefault": True,
-            "maxVisibleTransitionRatio": 0.30,
-            "maxDipBlack": 1,
+            "maxVisibleTransitionRatio": strength_policy["visibleRatio"],
+            "maxVisibleTransitions": strength_policy["maxVisible"],
+            "maxDipBlack": strength_policy["maxDipBlack"],
         },
     }
 
@@ -336,8 +409,8 @@ def improve_first_cut_with_ai(
             if end - start < 1.0:
                 continue
 
-            zoom = max(1.0, min(1.15, float(ai_scene.get("zoomFactor", 1.0))))
-            speed = max(0.75, min(1.35, float(ai_scene.get("speed", 1.0))))
+            zoom = max(1.0, min(float(strength_policy["maxZoomFactor"]), float(ai_scene.get("zoomFactor", 1.0))))
+            speed = max(float(strength_policy["minSpeed"]), min(float(strength_policy["maxSpeed"]), float(ai_scene.get("speed", 1.0))))
 
             updated = dict(original)
             updated["start"] = round(start, 3)
@@ -356,11 +429,11 @@ def improve_first_cut_with_ai(
             used_ids.add(scene_id)
             last_end = end
 
-        _apply_transition_guard(final_scenes)
+        _apply_transition_guard(final_scenes, edit_strength)
 
         enabled_count = sum(1 for scene in final_scenes if scene.get("enabled", True))
-        if enabled_count < 2:
-            raise ValueError("AI_PLAN_TOO_SPARSE")
+        if enabled_count < minimum_enabled:
+            raise ValueError(f"AI_PLAN_TOO_SPARSE_FOR_{edit_strength.upper()}:{enabled_count}<{minimum_enabled}")
 
         return final_scenes, {
             "enabled": True,
@@ -371,6 +444,9 @@ def improve_first_cut_with_ai(
             "visionScore": vision_analysis.get("visionScore") if vision_enabled and vision_analysis else None,
             "localShiftLimitSec": round(local_shift, 3) if vision_enabled else 0.0,
             "directorVersion": DIRECTOR_VERSION,
+            "editStrength": edit_strength,
+            "strengthPolicy": strength_policy,
+            "minimumEnabledScenes": minimum_enabled,
             "fallbackVersion": R1_FALLBACK_VERSION,
         }
 
@@ -381,6 +457,9 @@ def improve_first_cut_with_ai(
             "model": model,
             "visionAware": vision_enabled,
             "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            "editStrength": edit_strength,
+            "strengthPolicy": strength_policy,
+            "minimumEnabledScenes": minimum_enabled,
             "directorVersion": DIRECTOR_VERSION,
             "fallbackVersion": R1_FALLBACK_VERSION,
         }
