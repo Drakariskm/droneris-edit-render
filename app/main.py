@@ -19,7 +19,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.6.0_AI_EDIT_STRENGTH_R1_FREE_SAFE"
+APP_VERSION = "DRONERIS_RENDER_BACKEND_R1.6.1_LOW_TRANSITION_POLICY_R1_FREE_SAFE"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
 
@@ -272,6 +272,7 @@ EDIT_STRENGTH_PROFILES: dict[str, dict[str, Any]] = {
         "maxSpeed": 1.10,
         "maxZoomFactor": 1.08,
         "maxVisibleTransitionRatio": 0.15,
+        "minVisibleTransitions": 1,
         "maxVisibleTransitions": 2,
         "maxDipBlack": 0,
     },
@@ -284,6 +285,7 @@ EDIT_STRENGTH_PROFILES: dict[str, dict[str, Any]] = {
         "maxSpeed": 1.25,
         "maxZoomFactor": 1.12,
         "maxVisibleTransitionRatio": 0.30,
+        "minVisibleTransitions": 0,
         "maxVisibleTransitions": 4,
         "maxDipBlack": 1,
     },
@@ -296,6 +298,7 @@ EDIT_STRENGTH_PROFILES: dict[str, dict[str, Any]] = {
         "maxSpeed": 1.35,
         "maxZoomFactor": 1.15,
         "maxVisibleTransitionRatio": 0.35,
+        "minVisibleTransitions": 0,
         "maxVisibleTransitions": 5,
         "maxDipBlack": 1,
     },
@@ -1038,6 +1041,7 @@ async def create_job(
             "candidateCount": adaptive_candidate_count(target_first_cut_duration(sum(float(x.get("durationSec") or 0.0) for x in source_metas)), edit_strength),
             "maxZoomFactor": strength_profile["maxZoomFactor"],
             "speedRange": [strength_profile["minSpeed"], strength_profile["maxSpeed"]],
+            "minVisibleTransitions": strength_profile.get("minVisibleTransitions", 0),
             "maxVisibleTransitions": strength_profile["maxVisibleTransitions"],
         }
 

@@ -5,7 +5,7 @@ Functional change in this revision:
 - standard 75 s First Cut now generates 15 chronological candidates (~5 s nominal each)
 - shorter targets scale adaptively (6-18 candidates)
 - multi-source shared-pool selection is also adaptive and no longer capped by 7 editorial roles
-- AI Director prompt, Vision logic, transitions, renderer, upload API and frontend contract are unchanged
+- AI Director LOW transition policy is updated; Vision logic, renderer, upload API and frontend contract are unchanged
 
 Expected version from /health:
 DRONERIS_RENDER_BACKEND_R1.4.0_ADAPTIVE_FIRST_CUT_POOL_R1_FREE_SAFE

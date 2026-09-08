@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-DIRECTOR_VERSION = "DRONERIS_AI_EDIT_DIRECTOR_R4_STRENGTH_AWARE_2026_09_08"
+DIRECTOR_VERSION = "DRONERIS_AI_EDIT_DIRECTOR_R4_1_LOW_TRANSITION_POLICY_2026_09_08"
 R1_FALLBACK_VERSION = "DRONERIS_AI_EDIT_DIRECTOR_R1_2026_09_01"
 
 DRONERIS_DIRECTOR_PROMPT = """
@@ -94,7 +94,9 @@ This controls editorial intervention, not source quality or mission safety.
 LOW / restrained:
 - Prefer longer, calmer shots and preserve natural camera movement.
 - Make fewer timing, speed, and zoom interventions.
-- Keep visible transitions rare; CUT should dominate.
+- CUT should dominate, but a normal 10-14 clip film should usually contain 1-2 restrained visible transitions when suitable.
+- Prefer CROSSFADE for the LOW visible transition; DISSOLVE is acceptable only for a clear section/time change.
+- Never use DIP_BLACK at LOW strength.
 - Do not create artificial energy.
 
 MEDIUM / balanced:
@@ -218,17 +220,17 @@ EDIT_STRENGTH_POLICY: dict[str, dict[str, Any]] = {
     "low": {
         "label": "LOW",
         "minSpeed": 0.95, "maxSpeed": 1.10, "maxZoomFactor": 1.08,
-        "visibleRatio": 0.15, "maxVisible": 2, "maxDipBlack": 0,
+        "visibleRatio": 0.15, "minVisible": 1, "maxVisible": 2, "maxDipBlack": 0,
     },
     "medium": {
         "label": "MEDIUM",
         "minSpeed": 0.85, "maxSpeed": 1.25, "maxZoomFactor": 1.12,
-        "visibleRatio": 0.30, "maxVisible": 4, "maxDipBlack": 1,
+        "visibleRatio": 0.30, "minVisible": 0, "maxVisible": 4, "maxDipBlack": 1,
     },
     "high": {
         "label": "HIGH",
         "minSpeed": 0.75, "maxSpeed": 1.35, "maxZoomFactor": 1.15,
-        "visibleRatio": 0.35, "maxVisible": 5, "maxDipBlack": 1,
+        "visibleRatio": 0.35, "minVisible": 0, "maxVisible": 5, "maxDipBlack": 1,
     },
 }
 
@@ -269,6 +271,7 @@ def _apply_transition_guard(scenes: list[dict[str, Any]], edit_strength: str = "
     joins = max(0, len(enabled_indexes) - 1)
     ratio_budget = max(1, round(joins * float(policy["visibleRatio"]))) if joins else 0
     max_visible = min(int(policy["maxVisible"]), ratio_budget) if joins else 0
+    min_visible = min(int(policy.get("minVisible", 0)), max_visible) if joins else 0
     visible_seen = 0
     dip_black_seen = 0
     max_dip_black = int(policy["maxDipBlack"])
@@ -288,6 +291,49 @@ def _apply_transition_guard(scenes: list[dict[str, Any]], edit_strength: str = "
                 visible_seen += 1
         scene["transitionOut"] = kind
         scene["transitionDuration"] = _transition_duration(kind, scene.get("transitionDuration"))
+
+    # LOW must not collapse to an all-CUT plan on a normal First Cut.
+    # If the AI proposed no suitable visible transition, add exactly one
+    # restrained CROSSFADE at the best interior editorial join. This keeps
+    # CUT dominant while preventing the LOW mode from becoming mechanically
+    # identical to a pure hard-cut edit. Short edits remain untouched.
+    if visible_seen < min_visible and len(enabled_indexes) >= 6:
+        interior = enabled_indexes[:-1]
+        best_idx = None
+        best_score = float("-inf")
+        midpoint = (len(interior) - 1) / 2.0
+
+        for pos, idx in enumerate(interior):
+            # Avoid forcing a transition on the opening or final join.
+            if pos == 0 or pos == len(interior) - 1:
+                continue
+            scene = scenes[idx]
+            next_idx = enabled_indexes[pos + 1]
+            next_scene = scenes[next_idx]
+            current_type = str(scene.get("type") or scene.get("label") or "").upper()
+            next_type = str(next_scene.get("type") or next_scene.get("label") or "").upper()
+
+            score = -0.15 * abs(pos - midpoint)
+            if "HERO" in current_type or "HERO" in next_type:
+                score += 3.0
+            if ("DETAIL" in current_type or "POI" in current_type or
+                    "DETAIL" in next_type or "POI" in next_type):
+                score += 1.0
+            if "EXIT" in current_type or "EXIT" in next_type:
+                score -= 3.0
+            if "REVEAL" in current_type:
+                score -= 1.0
+
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        if best_idx is not None:
+            scenes[best_idx]["transitionOut"] = "CROSSFADE"
+            scenes[best_idx]["transitionDuration"] = 0.5
+            scenes[best_idx]["transitionReason"] = (
+                "LOW strength continuity guard: one restrained CROSSFADE keeps the edit soft while CUT remains dominant."
+            )
 
 def improve_first_cut_with_ai(
     *,
@@ -359,6 +405,7 @@ def improve_first_cut_with_ai(
             "allowedTransitions": ["CUT", "CROSSFADE", "DISSOLVE", "DIP_BLACK"],
             "cutIsDefault": True,
             "maxVisibleTransitionRatio": strength_policy["visibleRatio"],
+            "minVisibleTransitions": strength_policy.get("minVisible", 0),
             "maxVisibleTransitions": strength_policy["maxVisible"],
             "maxDipBlack": strength_policy["maxDipBlack"],
         },
